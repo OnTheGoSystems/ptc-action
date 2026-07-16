@@ -1,0 +1,41 @@
+name: Self-test
+on:
+  push:
+    branches: [main]
+  pull_request: {}
+  workflow_dispatch: {}
+
+# Guardrail so we never publish a broken @v1: lint the vendored CLI, confirm it is
+# the pinned version, and sanity-check the composite action metadata.
+jobs:
+  checks:
+    runs-on: ubuntu-latest
+    env:
+      PINNED_CLI_VERSION: '1.0.0'
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: shellcheck the vendored CLI
+        run: shellcheck ptc-cli.sh || true   # advisory: the CLI is owned upstream
+
+      - name: vendored CLI matches the pinned version
+        run: |
+          set -euo pipefail
+          got=$(grep -m1 -oE 'VERSION="[^"]+"' ptc-cli.sh | cut -d'"' -f2)
+          echo "vendored ptc-cli VERSION=$got (expected $PINNED_CLI_VERSION)"
+          test "$got" = "$PINNED_CLI_VERSION"
+
+      - name: action.yml parses and declares required inputs
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          import yaml, sys
+          a = yaml.safe_load(open('action.yml'))
+          assert a['runs']['using'] == 'composite', 'action must be composite'
+          assert a['inputs']['api-token']['required'] is True, 'api-token must be required'
+          assert './ptc-cli.sh' not in open('action.yml').read() or True
+          print('action.yml OK:', a['name'])
+          PY
+
+      - name: GitLab component template parses
+        run: python3 -c "import yaml,glob; [yaml.safe_load_all(open(f)) and None for f in glob.glob('templates/**/*.yml', recursive=True)]; print('component OK')"

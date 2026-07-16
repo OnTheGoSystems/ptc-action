@@ -1,0 +1,66 @@
+# PTC Translate — GitLab CI/CD Catalog component.
+#
+# Usage (in your .gitlab-ci.yml):
+#   include:
+#     - component: $CI_SERVER_FQDN/OnTheGoSystems/ptc-action/translate@1
+#       inputs:
+#         config-file: .ptc-config.yml
+#
+# Store the token as a MASKED CI/CD variable named PTC_API_TOKEN
+# (Settings → CI/CD → Variables). It is never placed on the command line.
+
+spec:
+  inputs:
+    stage:
+      default: deploy
+    config-file:
+      default: '.ptc-config.yml'
+    source-locale:
+      default: ''
+    patterns:
+      default: ''
+    api-url:
+      default: 'https://app.ptc.wpml.org/api/v1/'
+    file-tag-name:
+      default: ''
+    cli-version:
+      default: 'v1.0.0'
+    open-mr:
+      description: 'Open a merge request with the translations via the git push option.'
+      default: 'false'
+    mr-target-branch:
+      default: '$CI_DEFAULT_BRANCH'
+---
+
+"ptc-translate":
+  stage: $[[ inputs.stage ]]
+  image: alpine:latest
+  # Loop-safe: only on a push to the default branch, and never on a translation commit.
+  rules:
+    - if: '$CI_PIPELINE_SOURCE == "push" && $CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH && $CI_COMMIT_MESSAGE !~ /\[skip translations\]/'
+  variables:
+    PTC_CLI_URL: "https://raw.githubusercontent.com/OnTheGoSystems/ptc-cli/$[[ inputs.cli-version ]]/ptc-cli.sh"
+  before_script:
+    - apk add --no-cache bash curl git jq
+  script:
+    - curl -fsSL "$PTC_CLI_URL" -o ptc-cli.sh && chmod +x ptc-cli.sh
+    - |
+      set -euo pipefail
+      args=( --api-url "$[[ inputs.api-url ]]" )
+      [ -n "$[[ inputs.config-file ]]" ]   && args+=( --config-file "$[[ inputs.config-file ]]" )
+      [ -n "$[[ inputs.source-locale ]]" ] && args+=( --source-locale "$[[ inputs.source-locale ]]" )
+      [ -n "$[[ inputs.patterns ]]" ]      && args+=( --patterns "$[[ inputs.patterns ]]" )
+      [ -n "$[[ inputs.file-tag-name ]]" ] && args+=( --file-tag-name "$[[ inputs.file-tag-name ]]" )
+      ./ptc-cli.sh "${args[@]}"   # PTC_API_TOKEN comes from the masked CI/CD variable
+    - |
+      if [ "$[[ inputs.open-mr ]]" = "true" ] && ! git diff --quiet; then
+        git config user.email "ci@ptc"
+        git config user.name "PTC Translate"
+        git checkout -B ptc/translations
+        git add -A
+        git commit -m "chore(i18n): update translations via PTC [skip translations]"
+        git push -o merge_request.create \
+                 -o merge_request.target="$[[ inputs.mr-target-branch ]]" \
+                 -o merge_request.title="Update translations from PTC" \
+                 -f "https://gitlab-ci-token:${CI_JOB_TOKEN}@${CI_SERVER_HOST}/${CI_PROJECT_PATH}.git" HEAD:ptc/translations
+      fi
