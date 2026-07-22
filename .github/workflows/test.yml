@@ -13,7 +13,7 @@ jobs:
     env:
       PINNED_CLI_VERSION: '1.0.0'
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
       - name: shellcheck the vendored CLI
         run: shellcheck ptc-cli.sh || true   # advisory: the CLI is owned upstream
@@ -33,9 +33,36 @@ jobs:
           a = yaml.safe_load(open('action.yml'))
           assert a['runs']['using'] == 'composite', 'action must be composite'
           assert a['inputs']['api-token']['required'] is True, 'api-token must be required'
-          assert './ptc-cli.sh' not in open('action.yml').read() or True
           print('action.yml OK:', a['name'])
           PY
 
+      - name: every third-party action is pinned to a commit SHA
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          import re, glob, sys
+          bad = []
+          for f in ['action.yml'] + glob.glob('.github/workflows/*.yml'):
+              for n, line in enumerate(open(f), 1):
+                  m = re.search(r'uses:\s*([\w.-]+/[\w.-]+)@(\S+)', line)
+                  # actions/* are first-party GitHub actions; everything else must be SHA-pinned.
+                  if m and not m.group(1).startswith('actions/') and not re.fullmatch(r'[0-9a-f]{40}', m.group(2)):
+                      bad.append(f'{f}:{n} {m.group(1)}@{m.group(2)}')
+          if bad:
+              sys.exit('third-party action not SHA-pinned:\n  ' + '\n  '.join(bad))
+          print('third-party action pinning OK')
+          PY
+
       - name: GitLab component template parses
-        run: python3 -c "import yaml,glob; [yaml.safe_load_all(open(f)) and None for f in glob.glob('templates/**/*.yml', recursive=True)]; print('component OK')"
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          import yaml, glob
+          files = glob.glob('templates/**/*.yml', recursive=True)
+          assert files, 'no component templates found'
+          for f in files:
+              # list() forces the generator - safe_load_all alone parses nothing.
+              docs = list(yaml.safe_load_all(open(f)))
+              assert docs, f'{f} is empty'
+              print(f'{f}: {len(docs)} document(s) OK')
+          PY

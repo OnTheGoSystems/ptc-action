@@ -35,7 +35,7 @@ jobs:
   translate:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - uses: OnTheGoSystems/ptc-action@v1
         with:
           api-token: ${{ secrets.PTC_API_TOKEN }}
@@ -45,6 +45,8 @@ jobs:
 ```
 
 > ⚠️ **One-time setting for `create-pr`:** enable **Settings → Actions → General → "Allow GitHub Actions to create and approve pull requests"**. This is the #1 silent first-run failure.
+
+> **Self-hosted runners:** `create-pr` runs `peter-evans/create-pull-request` v8, which needs Node 24 — Actions Runner **v2.327.1 or later**. GitHub-hosted runners already satisfy this.
 
 ## Quick start (GitLab CI/CD)
 
@@ -96,7 +98,7 @@ The component only runs on a push to your default branch and skips translation c
 ## Security
 
 - The PTC token is read from an env var and `::add-mask::`ed — it never appears in `argv` or logs.
-- Every third-party dependency is pinned to a full commit SHA, not a movable tag (`peter-evans/create-pull-request`); pin the action itself to a full SHA too if your org requires it.
+- Every third-party dependency is pinned to a full commit SHA, not a movable tag (`peter-evans/create-pull-request` v8.1.1); pin the action itself to a full SHA too if your org requires it.
 - The GitLab component pins its base image (`alpine:3.22`) and checksum-verifies `ptc-cli.sh` against `cli-sha256` before executing it.
 
 ## License
