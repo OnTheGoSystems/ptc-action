@@ -23,8 +23,12 @@ spec:
       default: 'https://app.ptc.wpml.org/api/v1/'
     file-tag-name:
       default: ''
-    cli-version:
-      default: 'v1.0.0'
+    cli-ref:
+      description: 'ptc-cli git ref to fetch. Defaults to the immutable commit behind v1.0.0 — a tag can be moved, a commit cannot.'
+      default: '7ae60faeac2081c7eb31a9c85b6b940bc6a0a906'
+    cli-sha256:
+      description: 'Expected sha256 of ptc-cli.sh. Verified after download; set to an empty string to skip (only if you also override cli-ref).'
+      default: 'ea808d3870a8539bbe5a509f1356f9288e58c46eadb08a8ed037d0db2afec586'
     open-mr:
       description: 'Open a merge request with the translations via the git push option.'
       default: 'false'
@@ -34,24 +38,39 @@ spec:
 
 "ptc-translate":
   stage: $[[ inputs.stage ]]
-  image: alpine:latest
+  image: alpine:3.22
   # Loop-safe: only on a push to the default branch, and never on a translation commit.
   rules:
     - if: '$CI_PIPELINE_SOURCE == "push" && $CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH && $CI_COMMIT_MESSAGE !~ /\[skip translations\]/'
   variables:
-    PTC_CLI_URL: "https://raw.githubusercontent.com/OnTheGoSystems/ptc-cli/$[[ inputs.cli-version ]]/ptc-cli.sh"
+    PTC_CLI_URL: "https://raw.githubusercontent.com/OnTheGoSystems/ptc-cli/$[[ inputs.cli-ref ]]/ptc-cli.sh"
   before_script:
     - apk add --no-cache bash curl git jq
   script:
-    - curl -fsSL "$PTC_CLI_URL" -o ptc-cli.sh && chmod +x ptc-cli.sh
+    # Fetched at an immutable commit and checksum-verified, because a GitLab
+    # component ships YAML only - it cannot vendor a sibling file the way the
+    # GitHub composite action does.
     - |
-      set -euo pipefail
-      args=( --api-url "$[[ inputs.api-url ]]" )
-      [ -n "$[[ inputs.config-file ]]" ]   && args+=( --config-file "$[[ inputs.config-file ]]" )
-      [ -n "$[[ inputs.source-locale ]]" ] && args+=( --source-locale "$[[ inputs.source-locale ]]" )
-      [ -n "$[[ inputs.patterns ]]" ]      && args+=( --patterns "$[[ inputs.patterns ]]" )
-      [ -n "$[[ inputs.file-tag-name ]]" ] && args+=( --file-tag-name "$[[ inputs.file-tag-name ]]" )
-      ./ptc-cli.sh "${args[@]}"   # PTC_API_TOKEN comes from the masked CI/CD variable
+      set -eu
+      curl -fsSL "$PTC_CLI_URL" -o ptc-cli.sh
+      expected_sha="$[[ inputs.cli-sha256 ]]"
+      if [ -n "$expected_sha" ]; then
+        echo "$expected_sha  ptc-cli.sh" | sha256sum -c -
+      else
+        echo "WARNING: cli-sha256 is empty - ptc-cli.sh is not being verified."
+      fi
+      chmod +x ptc-cli.sh
+    # POSIX positional parameters, not bash arrays: alpine ships busybox ash and
+    # has no /bin/bash until before_script installs it, so this block has to run
+    # under either shell. ptc-cli.sh itself is #!/bin/bash and gets bash via apk.
+    - |
+      set -eu
+      set -- --api-url "$[[ inputs.api-url ]]"
+      [ -n "$[[ inputs.config-file ]]" ]   && set -- "$@" --config-file "$[[ inputs.config-file ]]"
+      [ -n "$[[ inputs.source-locale ]]" ] && set -- "$@" --source-locale "$[[ inputs.source-locale ]]"
+      [ -n "$[[ inputs.patterns ]]" ]      && set -- "$@" --patterns "$[[ inputs.patterns ]]"
+      [ -n "$[[ inputs.file-tag-name ]]" ] && set -- "$@" --file-tag-name "$[[ inputs.file-tag-name ]]"
+      ./ptc-cli.sh "$@"   # PTC_API_TOKEN comes from the masked CI/CD variable
     - |
       if [ "$[[ inputs.open-mr ]]" = "true" ] && ! git diff --quiet; then
         git config user.email "ci@ptc"

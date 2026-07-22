@@ -5,7 +5,7 @@ Translate your source files with **[Private Translation Cloud](https://ptc.wpml.
 - **GitHub:** a composite Marketplace action — `uses: OnTheGoSystems/ptc-action@v1`
 - **GitLab:** a CI/CD Catalog component — `include: component: .../ptc-action/translate@1`
 
-The CLI is **vendored and pinned** at [`ptc-cli` v1.0.0](https://github.com/OnTheGoSystems/ptc-cli/releases/tag/v1.0.0) — it is never downloaded from `main` at job time.
+Both pin [`ptc-cli` v1.0.0](https://github.com/OnTheGoSystems/ptc-cli/releases/tag/v1.0.0) — neither ever runs `main` at job time. The GitHub action **vendors** the script inside the action repo. A GitLab component can only ship YAML, so the component **fetches it at an immutable commit and verifies its sha256** before running it.
 
 ---
 
@@ -74,7 +74,7 @@ The component only runs on a push to your default branch and skips translation c
 | `api-url` | | `https://app.ptc.wpml.org/api/v1/` | Override for staging / self-hosted. |
 | `project-dir` | | `.` | Directory treated as project root. |
 | `create-pr` | | `false` | Open/update a PR with the translations. |
-| `pr-token` | | `${{ github.token }}` | Token that opens the PR (use a PAT/App token to trigger downstream CI). |
+| `pr-token` | | `''` → falls back to `github.token` | Token that opens the PR (use a PAT/App token to trigger downstream CI). |
 | `pr-branch` | | `ptc/translations` | Stable branch — re-runs update the same PR. |
 
 ### Outputs
@@ -96,7 +96,8 @@ The component only runs on a push to your default branch and skips translation c
 ## Security
 
 - The PTC token is read from an env var and `::add-mask::`ed — it never appears in `argv` or logs.
-- The CLI is vendored + pinned; pin the action itself to a full SHA if your org requires it.
+- Every third-party dependency is pinned to a full commit SHA, not a movable tag (`peter-evans/create-pull-request`); pin the action itself to a full SHA too if your org requires it.
+- The GitLab component pins its base image (`alpine:3.22`) and checksum-verifies `ptc-cli.sh` against `cli-sha256` before executing it.
 
 ## License
 
