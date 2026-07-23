@@ -25,6 +25,14 @@ inputs:
     description: 'PTC file tag (branch-scoped batch). Defaults to git-branch auto-detect inside the CLI.'
     required: false
     default: ''
+  monitor-interval:
+    description: 'Seconds between translation-status polls. CLI default is 5. Raise it on large projects to poll less often.'
+    required: false
+    default: ''
+  monitor-max-attempts:
+    description: 'How many times to poll before giving up. CLI default is 100, i.e. ~8 minutes at the default interval — a run that needs longer exits 1 with the unfinished files listed, so raise this for big projects.'
+    required: false
+    default: ''
   api-url:
     description: 'PTC API base URL. Override only for staging / self-hosted.'
     required: false
@@ -82,6 +90,8 @@ runs:
         [ -n "${{ inputs.source-locale }}" ] && args+=( --source-locale "${{ inputs.source-locale }}" )
         [ -n "${{ inputs.patterns }}" ]      && args+=( --patterns "${{ inputs.patterns }}" )
         [ -n "${{ inputs.file-tag-name }}" ] && args+=( --file-tag-name "${{ inputs.file-tag-name }}" )
+        [ -n "${{ inputs.monitor-interval }}" ]     && args+=( --monitor-interval "${{ inputs.monitor-interval }}" )
+        [ -n "${{ inputs.monitor-max-attempts }}" ] && args+=( --monitor-max-attempts "${{ inputs.monitor-max-attempts }}" )
         "$CLI" "${args[@]}"
 
     - name: Create/update translation pull request
