@@ -23,6 +23,12 @@ spec:
       default: 'https://app.ptc.wpml.org/api/v1/'
     file-tag-name:
       default: ''
+    monitor-interval:
+      description: 'Seconds between translation-status polls. CLI default is 5.'
+      default: ''
+    monitor-max-attempts:
+      description: 'How many polls before giving up. CLI default is 100 (~8 min at the default interval); a run that needs longer exits 1 with the unfinished files listed.'
+      default: ''
     cli-ref:
       description: 'ptc-cli git ref to fetch. Defaults to the immutable commit behind v1.0.0 — a tag can be moved, a commit cannot.'
       default: '7ae60faeac2081c7eb31a9c85b6b940bc6a0a906'
@@ -70,6 +76,8 @@ spec:
       [ -n "$[[ inputs.source-locale ]]" ] && set -- "$@" --source-locale "$[[ inputs.source-locale ]]"
       [ -n "$[[ inputs.patterns ]]" ]      && set -- "$@" --patterns "$[[ inputs.patterns ]]"
       [ -n "$[[ inputs.file-tag-name ]]" ] && set -- "$@" --file-tag-name "$[[ inputs.file-tag-name ]]"
+      [ -n "$[[ inputs.monitor-interval ]]" ]     && set -- "$@" --monitor-interval "$[[ inputs.monitor-interval ]]"
+      [ -n "$[[ inputs.monitor-max-attempts ]]" ] && set -- "$@" --monitor-max-attempts "$[[ inputs.monitor-max-attempts ]]"
       ./ptc-cli.sh "$@"   # PTC_API_TOKEN comes from the masked CI/CD variable
     - |
       if [ "$[[ inputs.open-mr ]]" = "true" ] && ! git diff --quiet; then
