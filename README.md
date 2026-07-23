@@ -5,7 +5,7 @@ Translate your source files with **[Private Translation Cloud](https://ptc.wpml.
 - **GitHub:** a composite Marketplace action — `uses: OnTheGoSystems/ptc-action@v1`
 - **GitLab:** a CI/CD Catalog component — `include: component: .../ptc-action/translate@1`
 
-Both pin [`ptc-cli` v1.0.0](https://github.com/OnTheGoSystems/ptc-cli/releases/tag/v1.0.0) — neither ever runs `main` at job time. The GitHub action **vendors** the script inside the action repo. A GitLab component can only ship YAML, so the component **fetches it at an immutable commit and verifies its sha256** before running it.
+Both pin [`ptc-cli` v1.0.1](https://github.com/OnTheGoSystems/ptc-cli/releases/tag/v1.0.1) — neither ever runs `main` at job time. The GitHub action **vendors** the script inside the action repo. A GitLab component can only ship YAML, so the component **fetches it at an immutable commit and verifies its sha256** before running it.
 
 ---
 
