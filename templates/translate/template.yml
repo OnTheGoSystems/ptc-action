@@ -31,10 +31,10 @@ spec:
       default: ''
     cli-ref:
       description: 'ptc-cli git ref to fetch. Defaults to the immutable commit behind v1.0.0 — a tag can be moved, a commit cannot.'
-      default: '7ae60faeac2081c7eb31a9c85b6b940bc6a0a906'
+      default: '7a8789dc6e4fec329aa1576179108681ff79892a'
     cli-sha256:
       description: 'Expected sha256 of ptc-cli.sh. Verified after download; set to an empty string to skip (only if you also override cli-ref).'
-      default: 'ea808d3870a8539bbe5a509f1356f9288e58c46eadb08a8ed037d0db2afec586'
+      default: 'ff36e8632396eadfc71253c74e022a837a5282ef50ea4159e452ae06b08c5400'
     open-mr:
       description: 'Open a merge request with the translations via the git push option.'
       default: 'false'
