@@ -7,7 +7,7 @@ branding:
 
 inputs:
   api-token:
-    description: 'PTC project API token. Pass ${{ secrets.PTC_API_TOKEN }}. Sent to PTC via the PTC_API_TOKEN env var only — never on the command line.'
+    description: 'PTC project API token. Pass the secrets.PTC_API_TOKEN value. Sent to PTC via the PTC_API_TOKEN env var only — never on the command line.'
     required: true
   config-file:
     description: 'Path to .ptc-config.yml (recommended — generate it once with `ptc init`). Takes precedence over source-locale/patterns.'
@@ -46,7 +46,7 @@ inputs:
     required: false
     default: 'false'
   pr-token:
-    description: 'Token used to open the PR. Leave empty to use GITHUB_TOKEN; supply a PAT or GitHub App token so the translation PR triggers your downstream CI (GITHUB_TOKEN-opened PRs do not). Composite-action input defaults cannot evaluate ${{ github.token }}, so the fallback happens in the step.'
+    description: 'Token used to open the PR. Leave empty to use GITHUB_TOKEN; supply a PAT or GitHub App token so the translation PR triggers your downstream CI (GITHUB_TOKEN-opened PRs do not). Composite-action input defaults cannot evaluate github.token, so the fallback happens in the step.'
     required: false
     default: ''
   pr-branch:
