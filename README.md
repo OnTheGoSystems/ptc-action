@@ -69,9 +69,9 @@ The component only runs on a push to your default branch and skips translation c
 | Input | Required | Default | Description |
 |---|---|---|---|
 | `api-token` | ✅ | — | PTC project token. Passed via the `PTC_API_TOKEN` env var, never argv. |
-| `config-file` | | `''` | Path to `.ptc-config.yml`. Takes precedence over `source-locale`/`patterns`. |
-| `source-locale` | | `''` | Source language code (with `patterns`). |
-| `patterns` | | `''` | Glob(s) with a `{{lang}}` slot. |
+| `config-file` | | `''` | Path to `.ptc-config.yml`. Optional: a `.ptc-config.yml` committed at the repo root is used on its own, and with no config at all the action detects the layout itself. Takes precedence over `source-locale`/`patterns`. |
+| `source-locale` | | `''` | Source language code. Only to override detection (with `patterns`). |
+| `patterns` | | `''` | Glob(s) with a `{{lang}}` slot. Only to override detection. |
 | `file-tag-name` | | auto | PTC file tag (defaults to the git branch). |
 | `api-url` | | `https://app.ptc.wpml.org/api/v1/` | Override for staging / self-hosted. |
 | `project-dir` | | `.` | Directory treated as project root. |
