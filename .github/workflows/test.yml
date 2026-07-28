@@ -33,6 +33,12 @@ jobs:
           a = yaml.safe_load(open('action.yml'))
           assert a['runs']['using'] == 'composite', 'action must be composite'
           assert a['inputs']['api-token']['required'] is True, 'api-token must be required'
+          # ci18-7277 — api-token is the ONLY required input: with nothing else
+          # set, the action runs `ptc init` itself and uses what it detects.
+          for optional in ('config-file', 'source-locale', 'patterns'):
+              assert a['inputs'][optional].get('required', False) is False, f'{optional} must stay optional'
+          run = a['runs']['steps'][0]['run']
+          assert 'init --yes' in run, 'the action must be able to detect the layout itself'
           print('action.yml OK:', a['name'])
           PY
 
