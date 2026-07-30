@@ -90,16 +90,16 @@ jobs:
           print('third-party action pinning OK')
           PY
 
-      - name: GitLab component template parses
+      # templates/ is gone: a GitLab CI/CD Catalog component is resolved only
+      # against the customer's own instance, so one we publish can never be
+      # included from anywhere else. The GitLab path is the inline job `ptc init`
+      # prints; there is no component left to parse. Guard against it coming back
+      # by accident, since a component would be dead on arrival.
+      - name: no GitLab component template has reappeared
         run: |
           set -euo pipefail
-          python3 - <<'PY'
-          import yaml, glob
-          files = glob.glob('templates/**/*.yml', recursive=True)
-          assert files, 'no component templates found'
-          for f in files:
-              # list() forces the generator - safe_load_all alone parses nothing.
-              docs = list(yaml.safe_load_all(open(f)))
-              assert docs, f'{f} is empty'
-              print(f'{f}: {len(docs)} document(s) OK')
-          PY
+          if [ -e templates ]; then
+            echo "::error::templates/ is back — a GitLab component cannot resolve cross-instance."
+            exit 1
+          fi
+          echo "no component template — OK"
