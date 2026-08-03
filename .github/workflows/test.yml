@@ -42,7 +42,7 @@ jobs:
           print('action.yml OK:', a['name'])
           PY
 
-      - name: no input is interpolated into a run: body
+      - name: no input is interpolated into a run body
         run: |
           set -euo pipefail
           python3 - <<'PY'
