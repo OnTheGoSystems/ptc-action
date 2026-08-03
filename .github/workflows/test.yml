@@ -46,10 +46,15 @@ jobs:
         run: |
           set -euo pipefail
           python3 - <<'PY'
-          import re, yaml
-          # `${{ }}` is substituted before bash parses the script, so an input
-          # pasted into a run: body executes whatever shell syntax it carries.
-          # Inputs must reach the script through env: and be read as "$INPUT_*".
+          import yaml
+          # Expression interpolation is resolved before bash parses the script,
+          # so an input pasted into a run body executes whatever shell syntax it
+          # carries. Inputs must arrive through env: and be read as "$INPUT_*".
+          #
+          # This file cannot spell the delimiters literally: everything inside a
+          # run body is itself interpolated, so writing them here would make the
+          # workflow fail to load. Hence the assembled OPEN below.
+          OPEN = '$' + '{' + '{'
           steps = yaml.safe_load(open('action.yml'))['runs']['steps']
           offenders = []
           for step in steps:
@@ -59,13 +64,13 @@ jobs:
               for lineno, line in enumerate(body.splitlines(), 1):
                   if line.lstrip().startswith('#'):
                       continue
-                  for expr in re.findall(r'\$\{\{[^}]*\}\}', line):
-                      offenders.append(f"{step.get('name', '?')}:{lineno}  {expr}")
+                  if OPEN in line:
+                      offenders.append(f"{step.get('name', '?')} line {lineno}: {line.strip()}")
           assert not offenders, (
-              'inputs interpolated into a run: body — pass them via env: instead:\n'
+              'an input is interpolated into a run body; pass it via env instead:\n'
               + '\n'.join(offenders)
           )
-          print('no expression interpolation inside any run: body')
+          print('no expression interpolation inside any run body')
           PY
 
       - name: every third-party action is pinned to a commit SHA
