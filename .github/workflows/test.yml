@@ -42,6 +42,32 @@ jobs:
           print('action.yml OK:', a['name'])
           PY
 
+      - name: no input is interpolated into a run: body
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          import re, yaml
+          # `${{ }}` is substituted before bash parses the script, so an input
+          # pasted into a run: body executes whatever shell syntax it carries.
+          # Inputs must reach the script through env: and be read as "$INPUT_*".
+          steps = yaml.safe_load(open('action.yml'))['runs']['steps']
+          offenders = []
+          for step in steps:
+              body = step.get('run')
+              if not body:
+                  continue
+              for lineno, line in enumerate(body.splitlines(), 1):
+                  if line.lstrip().startswith('#'):
+                      continue
+                  for expr in re.findall(r'\$\{\{[^}]*\}\}', line):
+                      offenders.append(f"{step.get('name', '?')}:{lineno}  {expr}")
+          assert not offenders, (
+              'inputs interpolated into a run: body — pass them via env: instead:\n'
+              + '\n'.join(offenders)
+          )
+          print('no expression interpolation inside any run: body')
+          PY
+
       - name: every third-party action is pinned to a commit SHA
         run: |
           set -euo pipefail
