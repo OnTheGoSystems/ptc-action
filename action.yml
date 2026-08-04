@@ -71,10 +71,23 @@ runs:
       working-directory: ${{ inputs.project-dir }}
       env:
         PTC_API_TOKEN: ${{ inputs.api-token }}   # token via env, never argv
+        # Every other input rides an env var for the same reason the token does.
+        # `${{ }}` pastes the raw value into the script *before* bash parses it,
+        # so an input carrying shell syntax is executed rather than read. Passing
+        # it through the environment and dereferencing "$INPUT_*" below keeps a
+        # value a value, whatever it contains.
+        INPUT_CONFIG_FILE: ${{ inputs.config-file }}
+        INPUT_SOURCE_LOCALE: ${{ inputs.source-locale }}
+        INPUT_PATTERNS: ${{ inputs.patterns }}
+        INPUT_API_URL: ${{ inputs.api-url }}
+        INPUT_FILE_TAG_NAME: ${{ inputs.file-tag-name }}
+        INPUT_MONITOR_INTERVAL: ${{ inputs.monitor-interval }}
+        INPUT_MONITOR_MAX_ATTEMPTS: ${{ inputs.monitor-max-attempts }}
+        ACTION_PATH: ${{ github.action_path }}
       run: |
         set -euo pipefail
         echo "::add-mask::${PTC_API_TOKEN}"
-        CLI="${{ github.action_path }}/ptc-cli.sh"   # vendored + pinned, never curled at runtime
+        CLI="$ACTION_PATH/ptc-cli.sh"   # vendored + pinned, never curled at runtime
         chmod +x "$CLI"
 
         # ci18-7277 — api-token is the only required input. Resolution order,
@@ -91,9 +104,9 @@ runs:
         # layout itself. Before this, a caller who had not run `ptc init`
         # locally had to hand-write source-locale + patterns, which is exactly
         # the copy-paste step the whole on-ramp was meant to remove.
-        CONFIG="${{ inputs.config-file }}"
-        SOURCE_LOCALE="${{ inputs.source-locale }}"
-        PATTERNS="${{ inputs.patterns }}"
+        CONFIG="$INPUT_CONFIG_FILE"
+        SOURCE_LOCALE="$INPUT_SOURCE_LOCALE"
+        PATTERNS="$INPUT_PATTERNS"
 
         if [ -z "$CONFIG" ] && [ -f .ptc-config.yml ]; then
           CONFIG=".ptc-config.yml"
@@ -102,7 +115,7 @@ runs:
 
         if [ -z "$CONFIG" ] && { [ -z "$SOURCE_LOCALE" ] || [ -z "$PATTERNS" ]; }; then
           echo "No config and no source-locale/patterns — detecting the layout with \`ptc init\`."
-          if ! "$CLI" init --yes --api-url "${{ inputs.api-url }}"; then
+          if ! "$CLI" init --yes --api-url "$INPUT_API_URL"; then
             echo "::error::Could not detect this project's translatable files. Pass config-file, or source-locale + patterns."
             exit 1
           fi
@@ -118,13 +131,13 @@ runs:
           sed 's/^/  /' .ptc-config.yml
         fi
 
-        args=( --api-url "${{ inputs.api-url }}" )
+        args=( --api-url "$INPUT_API_URL" )
         [ -n "$CONFIG" ]        && args+=( --config-file "$CONFIG" )
         [ -n "$SOURCE_LOCALE" ] && [ -z "$CONFIG" ] && args+=( --source-locale "$SOURCE_LOCALE" )
         [ -n "$PATTERNS" ]      && [ -z "$CONFIG" ] && args+=( --patterns "$PATTERNS" )
-        [ -n "${{ inputs.file-tag-name }}" ] && args+=( --file-tag-name "${{ inputs.file-tag-name }}" )
-        [ -n "${{ inputs.monitor-interval }}" ]     && args+=( --monitor-interval "${{ inputs.monitor-interval }}" )
-        [ -n "${{ inputs.monitor-max-attempts }}" ] && args+=( --monitor-max-attempts "${{ inputs.monitor-max-attempts }}" )
+        [ -n "$INPUT_FILE_TAG_NAME" ] && args+=( --file-tag-name "$INPUT_FILE_TAG_NAME" )
+        [ -n "$INPUT_MONITOR_INTERVAL" ]     && args+=( --monitor-interval "$INPUT_MONITOR_INTERVAL" )
+        [ -n "$INPUT_MONITOR_MAX_ATTEMPTS" ] && args+=( --monitor-max-attempts "$INPUT_MONITOR_MAX_ATTEMPTS" )
         "$CLI" "${args[@]}"
 
     - name: Create/update translation pull request
