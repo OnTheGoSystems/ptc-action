@@ -34,7 +34,7 @@ inputs:
     required: false
     default: ''
   api-url:
-    description: 'PTC API base URL. Override only for staging / self-hosted.'
+    description: 'PTC API base URL. Override only for a self-hosted instance.'
     required: false
     default: 'https://app.ptc.wpml.org/api/v1/'
   project-dir:
@@ -90,7 +90,7 @@ runs:
         CLI="$ACTION_PATH/ptc-cli.sh"   # vendored + pinned, never curled at runtime
         chmod +x "$CLI"
 
-        # ci18-7277 — api-token is the only required input. Resolution order,
+        # api-token is the only required input. Resolution order,
         # first match wins:
         #
         #   1. config-file      — an explicit path the caller passed
