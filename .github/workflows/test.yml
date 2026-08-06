@@ -103,3 +103,27 @@ jobs:
               assert docs, f'{f} is empty'
               print(f'{f}: {len(docs)} document(s) OK')
           PY
+
+      # ci18-7363: the template stays as a source for anyone mirroring it into
+      # their OWN instance, but we must never hand out an address for it. A
+      # component address is resolved by the customer's GitLab, so the
+      # $CI_SERVER_FQDN in one we print is always their server, and the include
+      # fails before any of our code runs.
+      - name: no component address is handed out
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          import glob, re, sys
+          # Our own path inside a component address — the exact string a reader
+          # could copy. Prose about component: in general is fine.
+          pattern = re.compile(r'component:.*OnTheGoSystems/ptc-action')
+          bad = []
+          for f in ['README.md', 'action.yml'] + glob.glob('templates/**/*.yml', recursive=True):
+              for n, line in enumerate(open(f), 1):
+                  if pattern.search(line):
+                      bad.append(f'{f}:{n} {line.strip()}')
+          if bad:
+              sys.exit('a component address is being handed out; it cannot resolve '
+                       'cross-instance:\n  ' + '\n  '.join(bad))
+          print('no component address handed out — OK')
+          PY
