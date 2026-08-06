@@ -2,8 +2,10 @@
 
 Translate your source files with **[Private Translation Cloud](https://ptc.wpml.org) (WPML)** straight from CI — and get the results back as a self-updating pull request on every source push. PTC never touches your repo; the action runs the pinned [`ptc-cli`](https://github.com/OnTheGoSystems/ptc-cli) in **your** pipeline and your own token opens the PR.
 
-- **GitHub:** a composite Marketplace action — `uses: OnTheGoSystems/ptc-action@v1`
+- **GitHub:** a composite action, used straight from this repository — `uses: OnTheGoSystems/ptc-action@v1`
 - **GitLab:** an inline job that `ptc init` prints for you — see [below](#quick-start-gitlab-cicd)
+
+There is no GitHub Marketplace listing. `uses:` resolves against the repository, so the reference above works without one.
 
 This action **vendors** [`ptc-cli` v1.0.3](https://github.com/OnTheGoSystems/ptc-cli/tree/v1.0.3) inside the action repo, so it never runs `main` at job time — the script that ships with a given action tag is the script that runs.
 
@@ -90,6 +92,13 @@ Pin `v1.0.3` to a different release if you want, and add a `sha256sum` check to 
 ```
 87efed00bd9345b9a4d5fb1972d8d53525246f6a2a4e6a48ae7d20d67e41362a  ptc-cli.sh
 ```
+
+<details>
+<summary>Running it as a component on your own instance</summary>
+
+`templates/translate/template.yml` in this repository is the component source, kept for anyone who wants to mirror it into their **own** GitLab and include it from there — where `$CI_SERVER_FQDN` finally is your server, so the address resolves. Copy the repository to your instance, publish it to your CI/CD Catalog, and include it under your own address. We publish it nowhere, and nothing PTC prints points at it.
+
+</details>
 
 ---
 
