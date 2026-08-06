@@ -60,7 +60,7 @@ spec:
   variables:
     PTC_CLI_URL: "https://raw.githubusercontent.com/OnTheGoSystems/ptc-cli/$[[ inputs.cli-ref ]]/ptc-cli.sh"
   before_script:
-    - apk add --no-cache bash curl git jq
+    - apk add --no-cache bash curl git unzip
   script:
     # Fetched at an immutable commit and checksum-verified, because a GitLab
     # component ships YAML only - it cannot vendor a sibling file the way the

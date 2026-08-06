@@ -62,7 +62,7 @@ ptc-translate:
   rules:
     - if: '$CI_PIPELINE_SOURCE == "push" && $CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH'
   before_script:
-    - apk add --no-cache bash curl git jq
+    - apk add --no-cache bash curl git unzip
   script:
     - curl -fsSL https://raw.githubusercontent.com/OnTheGoSystems/ptc-cli/v1.0.3/ptc-cli.sh -o ptc-cli.sh
     - chmod +x ptc-cli.sh
@@ -82,6 +82,8 @@ ptc-translate:
 ```
 
 Store `PTC_API_TOKEN` as a **masked** CI/CD variable (Settings → CI/CD → Variables). It is read from the environment, never placed on the command line.
+
+On the `before_script` line: `bash` and `curl` are what a bare `alpine:3.22` lacks, `git` is for the push step at the end of the job, and `unzip` unpacks the downloaded translations — alpine already provides it as a busybox applet, so it is named only to survive an image swap. `jq` used to be on that line and is never invoked (ci18-7398).
 
 **The push needs a token that may write to the repository.** `CI_JOB_TOKEN` can, but only if a maintainer enables Settings → CI/CD → Job token permissions → *"Allow Git push requests to the repository"* (GitLab 18.4+, off by default). Otherwise set `PTC_GIT_PUSH_TOKEN` to a project access token with the `write_repository` scope, also masked.
 
