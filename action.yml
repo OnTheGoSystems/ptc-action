@@ -84,6 +84,7 @@ runs:
         INPUT_MONITOR_INTERVAL: ${{ inputs.monitor-interval }}
         INPUT_MONITOR_MAX_ATTEMPTS: ${{ inputs.monitor-max-attempts }}
         ACTION_PATH: ${{ github.action_path }}
+        INPUT_PROJECT_DIR: ${{ inputs.project-dir }}
       run: |
         set -euo pipefail
         echo "::add-mask::${PTC_API_TOKEN}"
@@ -140,6 +141,53 @@ runs:
         [ -n "$INPUT_MONITOR_MAX_ATTEMPTS" ] && args+=( --monitor-max-attempts "$INPUT_MONITOR_MAX_ATTEMPTS" )
         "$CLI" "${args[@]}"
 
+        # The pull request must carry translation output and nothing else.
+        # Committing the whole workspace sweeps in anything the caller's job
+        # left dirty before us - a build, a codegen, a lockfile rewritten by an
+        # install - and ships it under our name. Scope the commit to the same
+        # paths the translation was written to: the config's `output:` entries,
+        # or the inline patterns when the caller spelled them out.
+        RAW_PATHS=""
+        if [ -n "$CONFIG" ] && [ -f "$CONFIG" ]; then
+          RAW_PATHS=$(grep -A999 '^files:' "$CONFIG" | grep '^ *output:' | sed 's/^ *output: *//' || true)
+        elif [ -n "$PATTERNS" ]; then
+          RAW_PATHS=$(printf '%s' "$PATTERNS" | tr ',' '\n')
+        fi
+
+        # create-pull-request resolves paths from the repository root, while the
+        # CLI ran in project-dir, so anything but "." needs the prefix back.
+        PREFIX=""
+        case "${INPUT_PROJECT_DIR:-.}" in
+          ""|".") PREFIX="" ;;
+          *)      PREFIX="${INPUT_PROJECT_DIR%/}/" ;;
+        esac
+
+        ADD_PATHS=""
+        while IFS= read -r out_path; do
+          out_path="${out_path#"${out_path%%[![:space:]]*}"}"
+          out_path="${out_path%"${out_path##*[![:space:]]}"}"
+          [ -z "$out_path" ] && continue
+          # {{lang}} is the CLI's language slot; a glob covers every locale it wrote.
+          out_path="${out_path//\{\{lang\}\}/*}"
+          ADD_PATHS="${ADD_PATHS}${ADD_PATHS:+$'\n'}${PREFIX}${out_path}"
+        done <<< "$RAW_PATHS"
+
+        if [ -z "$ADD_PATHS" ]; then
+          # Keep the old behaviour rather than silently committing nothing, but
+          # say so - a PR from here may carry more than translations.
+          echo "::warning::Could not determine the translation output paths; the pull request will include every change in the workspace."
+          ADD_PATHS="."
+        fi
+
+        echo "Translation paths staged for the pull request:"
+        printf '%s\n' "$ADD_PATHS" | sed 's/^/  /'
+
+        {
+          echo "add-paths<<PTC_ADD_PATHS_EOF"
+          printf '%s\n' "$ADD_PATHS"
+          echo "PTC_ADD_PATHS_EOF"
+        } >> "$GITHUB_OUTPUT"
+
     - name: Create/update translation pull request
       id: cpr
       if: ${{ inputs.create-pr == 'true' }}
@@ -150,7 +198,11 @@ runs:
       with:
         token: ${{ inputs.pr-token != '' && inputs.pr-token || github.token }}
         branch: ${{ inputs.pr-branch }}
-        base: ${{ github.ref_name }}
+        # On a pull_request event github.ref_name is `NN/merge`, an internal
+        # ref that is not a branch, so a PR opened against it targets a base that
+        # does not exist. The event carries the real base branch; fall back to
+        # ref_name for push and schedule, where it is already correct.
+        base: ${{ github.event.pull_request.base.ref || github.ref_name }}
         title: 'Update translations from PTC'
         commit-message: 'chore(i18n): update translations via PTC [skip translations]'
         body: |
@@ -159,4 +211,4 @@ runs:
           - Source: `${{ github.sha }}`
           - Re-runs update this same PR.
         delete-branch: true
-        add-paths: '.'
+        add-paths: ${{ steps.ptc.outputs.add-paths }}

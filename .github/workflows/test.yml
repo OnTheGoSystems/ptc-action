@@ -127,3 +127,35 @@ jobs:
                        'cross-instance:\n  ' + '\n  '.join(bad))
           print('no component address handed out — OK')
           PY
+
+      # A translation PR must contain translations. `add-paths: '.'` committed
+      # whatever else the caller's job had left dirty in the workspace, and
+      # `base: github.ref_name` is `NN/merge` on a pull_request event - an
+      # internal ref, not a branch, so the PR targeted a base that never existed.
+      - name: the translation PR is scoped and targets a real base branch
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          import yaml
+          steps = yaml.safe_load(open('action.yml'))['runs']['steps']
+          cpr = next(s for s in steps if s.get('id') == 'cpr')
+          with_block = cpr['with']
+
+          add_paths = str(with_block['add-paths'])
+          assert add_paths.strip() != '.', (
+              'add-paths commits the whole workspace; scope it to translation output')
+          assert 'steps.ptc.outputs.add-paths' in add_paths, (
+              'add-paths must come from the paths the translate step derived')
+
+          base = str(with_block['base'])
+          assert 'pull_request' in base, (
+              'base must resolve the real base branch on a pull_request event, '
+              'where github.ref_name is NN/merge')
+
+          translate = steps[0]
+          assert 'INPUT_PROJECT_DIR' in translate['env'], (
+              'project-dir must reach the script through env, like every other input')
+          assert 'add-paths<<' in translate['run'], (
+              'the translate step must publish the add-paths output')
+          print('translation PR scope and base OK')
+          PY
