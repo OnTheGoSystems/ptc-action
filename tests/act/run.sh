@@ -44,9 +44,16 @@ fi
 # The mock answers the vendored CLI's calls, so a CLI bump can silently leave
 # it speaking the wrong protocol. Fail here rather than debug a fixture that
 # tests the wrong thing.
-MOCK_CLI_VERSION="$(grep -oE 'ptc-cli [0-9]+\.[0-9]+\.[0-9]+' "$HERE/mock_ptc_api.py" | head -1 | awk '{print $2}')"
+# `ptc-cli.sh 1.0.4` as well as `ptc-cli 1.0.4`: the first spelling is what the
+# mock's own docstring uses, and matching only the second made this guard skip
+# itself silently - which is exactly the failure it exists to prevent.
+MOCK_CLI_VERSION="$(grep -oE 'ptc-cli(\.sh)? [0-9]+\.[0-9]+\.[0-9]+' "$HERE/mock_ptc_api.py" | head -1 | grep -oE '[0-9]+\.[0-9]+\.[0-9]+')"
 VENDORED_CLI_VERSION="$(grep -m1 -oE 'VERSION="[^"]+"' "$REPO/ptc-cli.sh" | cut -d'"' -f2)"
-if [ -n "$MOCK_CLI_VERSION" ] && [ "$MOCK_CLI_VERSION" != "$VENDORED_CLI_VERSION" ]; then
+if [ -z "$MOCK_CLI_VERSION" ]; then
+  echo "could not read the CLI version the mock was written for; the drift guard would be silent" >&2
+  exit 1
+fi
+if [ "$MOCK_CLI_VERSION" != "$VENDORED_CLI_VERSION" ]; then
   echo "the mock was written for ptc-cli $MOCK_CLI_VERSION but $VENDORED_CLI_VERSION is vendored; re-check it before trusting these results" >&2
   exit 1
 fi

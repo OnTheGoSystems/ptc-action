@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Minimal stand-in for the PTC API, enough to drive ptc-cli.sh 1.0.3 end to end.
+"""Minimal stand-in for the PTC API, enough to drive ptc-cli.sh 1.0.4 end to end.
 
 Endpoints (all under /api/v1/):
     GET  languages                        -> preflight #1 (+ balance headers)

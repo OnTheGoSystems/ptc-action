@@ -7,7 +7,7 @@ Translate your source files with **[Private Translation Cloud](https://ptc.wpml.
 
 There is no GitHub Marketplace listing. `uses:` resolves against the repository, so the reference above works without one.
 
-This action **vendors** [`ptc-cli` v1.0.3](https://github.com/OnTheGoSystems/ptc-cli/tree/v1.0.3) inside the action repo, so it never runs `main` at job time — the script that ships with a given action tag is the script that runs.
+This action **vendors** [`ptc-cli` v1.0.4](https://github.com/OnTheGoSystems/ptc-cli/tree/v1.0.4) inside the action repo, so it never runs `main` at job time — the script that ships with a given action tag is the script that runs.
 
 ---
 
@@ -68,15 +68,19 @@ ptc-translate:
   before_script:
     - apk add --no-cache bash curl git unzip
   script:
-    - curl -fsSL https://raw.githubusercontent.com/OnTheGoSystems/ptc-cli/v1.0.3/ptc-cli.sh -o ptc-cli.sh
+    - curl -fsSL https://raw.githubusercontent.com/OnTheGoSystems/ptc-cli/v1.0.4/ptc-cli.sh -o ptc-cli.sh
     - chmod +x ptc-cli.sh
     - ./ptc-cli.sh --config-file .ptc-config.yml
+    # `git add -A` comes BEFORE the check, and the check reads the index. On the
+    # first run the translations are new files, and a plain `git diff` only
+    # looks at tracked ones - it would report "nothing changed", skip the push,
+    # and leave a green job that produced no merge request.
     - |
-      if ! git diff --quiet; then
-        git config user.email "ci@ptc"
-        git config user.name "PTC Translate"
-        git checkout -B ptc/translations
-        git add -A
+      git config user.email "ci@ptc"
+      git config user.name "PTC Translate"
+      git checkout -B ptc/translations
+      git add -A
+      if ! git diff --cached --quiet; then
         git commit -m "chore(i18n): update translations via PTC [skip ci]"
         git push -o merge_request.create \
                  -o merge_request.target="$CI_DEFAULT_BRANCH" \
@@ -93,10 +97,10 @@ On the `before_script` line: `bash` and `curl` are what a bare `alpine:3.22` lac
 
 Loop-safe twice over: the job only runs on a push to the default branch — the translation push targets `ptc/translations`, so it cannot re-trigger — and the commit carries `[skip ci]`, the only skip token GitLab honours.
 
-Pin `v1.0.3` to a different release if you want, and add a `sha256sum` check to get the same integrity guarantee the GitHub action gets from vendoring:
+Pin `v1.0.4` to a different release if you want, and add a `sha256sum` check to get the same integrity guarantee the GitHub action gets from vendoring:
 
 ```
-87efed00bd9345b9a4d5fb1972d8d53525246f6a2a4e6a48ae7d20d67e41362a  ptc-cli.sh
+29f66e8a3b89521e8e1e6a1e91e3a6ea014c6258da8518ac0694cb6cf5694945  ptc-cli.sh
 ```
 
 <details>
