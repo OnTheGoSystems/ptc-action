@@ -8,7 +8,7 @@ set -euo pipefail  # Strict mode: exit on errors, undefined variables and pipe e
 # Constants
 readonly SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 readonly SCRIPT_NAME="$(basename "$0")"
-readonly VERSION="1.0.3"
+readonly VERSION="1.0.4"
 readonly PTC_USER_AGENT="ptc-cli/${VERSION}"
 
 # Colors for output
@@ -28,7 +28,7 @@ PTC_FILE_TAG_NAME=""
 PTC_API_URL="https://app.ptc.wpml.org/api/v1/"
 # The API token is env-first: an inherited PTC_API_TOKEN is honoured across every
 # command, and --api-token overrides it. The api_token: config key is deprecated
-# and ignored (ci18-7251 §6), so there is nothing else to reconcile — do NOT reset
+# and ignored, so there is nothing else to reconcile — do NOT reset
 # this to "", or the translate pipeline would lose the env token.
 PTC_API_TOKEN="${PTC_API_TOKEN:-}"
 PTC_VERBOSE=false
@@ -66,7 +66,82 @@ log_debug() {
 # User-Agent (ptc-cli/<VERSION>). It forwards to the real curl - which the test
 # suites stub - so the header rides along as an ordinary -H the stubs already skip.
 ptc_curl() {
-    curl -H "User-Agent: $PTC_USER_AGENT" "$@"
+    # PTC_HEADER_DUMP lets a caller read response headers without every call
+    # site having to thread a -D through its own curl invocation. Only the
+    # rate-limit retry sets it; everything else runs exactly as before.
+    if [[ -n "${PTC_HEADER_DUMP:-}" ]]; then
+        curl -H "User-Agent: $PTC_USER_AGENT" -D "$PTC_HEADER_DUMP" "$@"
+    else
+        curl -H "User-Agent: $PTC_USER_AGENT" "$@"
+    fi
+}
+
+# --- rate limiting -----------------------------------------------------------
+# create + process + bulk share ONE bucket of PTC_RATE_LIMIT_HINT requests per
+# minute, and a run spends two of them per file, so any project past a handful
+# of files meets a 429 partway through. Failing there is the worst outcome
+# available: the files uploaded before it are already registered and the words
+# may already be paid for, so the run must wait rather than abort.
+readonly PTC_RATE_LIMIT_MAX_RETRIES=5
+readonly PTC_RATE_LIMIT_BASE_DELAY=15
+readonly PTC_RATE_LIMIT_MAX_DELAY=60
+# Internal signal between a request function and the retry wrapper. It never
+# reaches the shell: the wrapper turns it into 0 (recovered) or 1 (gave up).
+readonly PTC_RATE_LIMITED=8
+
+# Seconds to wait before attempt N. Honours Retry-After when the server sends
+# one; PTC does not today (checked 2026-08-04), so the fallback walks towards
+# the one-minute window the limit is measured over.
+rate_limit_delay() {
+    local attempt="$1" header_file="${2:-}"
+    local retry_after=""
+
+    if [[ -n "$header_file" && -f "$header_file" ]]; then
+        retry_after=$(grep -i '^retry-after:' "$header_file" 2>/dev/null \
+            | tail -n 1 | tr -d '\r' \
+            | sed -E 's/^[Rr]etry-[Aa]fter:[[:space:]]*//')
+    fi
+
+    if [[ "$retry_after" =~ ^[0-9]+$ ]] && (( retry_after > 0 )); then
+        (( retry_after > 300 )) && retry_after=300   # a bad header must not hang the job
+        printf '%s' "$retry_after"
+        return 0
+    fi
+
+    local delay=$(( PTC_RATE_LIMIT_BASE_DELAY * attempt ))
+    (( delay > PTC_RATE_LIMIT_MAX_DELAY )) && delay=$PTC_RATE_LIMIT_MAX_DELAY
+    printf '%s' "$delay"
+}
+
+# Runs a request function, waiting out HTTP 429 instead of failing on it.
+# The function must return PTC_RATE_LIMITED to ask for a retry; any other exit
+# status is passed straight through, so non-429 failures still fail fast.
+call_with_rate_limit_retry() {
+    local attempt=1 delay rc header_dump=""
+
+    header_dump=$(mktemp "${TMPDIR:-/tmp}/ptc-headers.XXXXXX" 2>/dev/null) || header_dump=""
+
+    while :; do
+        PTC_HEADER_DUMP="$header_dump" "$@"
+        rc=$?
+
+        if (( rc != PTC_RATE_LIMITED )); then
+            [[ -n "$header_dump" ]] && rm -f "$header_dump"
+            return $rc
+        fi
+
+        if (( attempt > PTC_RATE_LIMIT_MAX_RETRIES )); then
+            [[ -n "$header_dump" ]] && rm -f "$header_dump"
+            log_error "PTC is still rate limiting after $PTC_RATE_LIMIT_MAX_RETRIES retries; giving up."
+            log_info "The limit is per organization, so another job or a teammate may be sending requests too."
+            return 1
+        fi
+
+        delay=$(rate_limit_delay "$attempt" "$header_dump")
+        log_warning "PTC rate limit reached (HTTP 429). Waiting ${delay}s, then retry ${attempt} of ${PTC_RATE_LIMIT_MAX_RETRIES}."
+        sleep "$delay"
+        attempt=$(( attempt + 1 ))
+    done
 }
 
 # JSON field readers. The API returns compact JSON today, but these tolerate
@@ -122,7 +197,7 @@ json_bool_field() {
     fi
 }
 
-# ci18-7342 - a rejected request reaches us in one of two shapes, depending on
+# A rejected request reaches us in one of two shapes, depending on
 # which server build answers:
 #
 #   older: HTTP 200  + {"success":false,"message":"Unprocessable Entity","code":422,...}
@@ -131,7 +206,7 @@ json_bool_field() {
 # Trusting the status alone reads the first shape as success. That is how a
 # rejected `process` call used to print "processing started successfully" and
 # leave CI green with no translations, and how `download` used to save the JSON
-# error body as a .zip and try to unpack it. Production and staging will not
+# error body as a .zip and try to unpack it. Deployments will not
 # flip on the same day, so the CLI has to read both the same way - the body is
 # the authority when it disagrees with the status.
 #
@@ -154,15 +229,26 @@ response_indicates_failure() {
 # than dropping it.
 describe_api_failure() {
     local http_code="$1" body="${2:-}"
-    local message codes
+    local message error codes
 
     message=$(json_string_field "$body" "message")
+    # Several endpoints answer with a plain {"error": "..."} instead of the
+    # {"message", "errors"} envelope - source_files#create and #process among
+    # them. Reading only "message" turned those into a bare "HTTP 422" in the
+    # CI log, which is the one place the reason was needed.
+    error=$(json_string_field "$body" "error")
     codes=$(printf '%s' "$body" | tr '\n' ' ' \
         | grep -Eo '"errors"[[:space:]]*:[[:space:]]*\[[^]]*\]' \
         | head -n 1 | sed -E 's/^"errors"[[:space:]]*:[[:space:]]*//') || true
 
     local description="HTTP $http_code"
-    [[ -n "$message" ]] && description="$description: $message"
+    if [[ -n "$message" ]]; then
+        description="$description: $message"
+        # Both keys present and different: keep each, they say different things.
+        [[ -n "$error" && "$error" != "$message" ]] && description="$description ($error)"
+    elif [[ -n "$error" ]]; then
+        description="$description: $error"
+    fi
     [[ -n "$codes" ]] && description="$description (error codes: $codes)"
     printf '%s' "$description"
 }
@@ -580,7 +666,7 @@ parse_config_file() {
         fi
     fi
     
-    # ci18-7342 - the README has always documented these two as config keys, but
+    # The README has always documented these two as config keys, but
     # nothing read them: they were flags only. In CI that made the polling
     # ceiling (100 x 5s ~ 8.3 min) unreachable, because the GitHub action and the
     # GitLab component pass neither flag - a big project timed out and, with the
@@ -607,7 +693,7 @@ parse_config_file() {
         fi
     fi
 
-    # The api_token: config key is deprecated (ci18-7251 §6): a token in a
+    # The api_token: config key is deprecated: a token in a
     # committed file is a leak waiting to happen. Warn whenever the key is present
     # (even with an empty value) and ignore it; the token must come from the
     # PTC_API_TOKEN environment variable or --api-token.
@@ -870,7 +956,7 @@ perform_upload_action() {
                 additional_files_json=$(extract_additional_files "$PTC_CONFIG_FILE" "$relative_file_path")
             fi
             
-            if make_ptc_api_call "$file" "$relative_file_path" "$output_file_path" "$PTC_FILE_TAG_NAME" "$additional_files_json"; then
+            if call_with_rate_limit_retry make_ptc_api_call "$file" "$relative_file_path" "$output_file_path" "$PTC_FILE_TAG_NAME" "$additional_files_json"; then
                 uploaded_files+=("$file")
                 log_success "Upload completed: $relative_file_path"
             else
@@ -929,7 +1015,7 @@ perform_upload_action_with_config() {
             local additional_files_json=""
             additional_files_json=$(extract_additional_files "$PTC_CONFIG_FILE" "$relative_file_path")
             
-            if make_ptc_api_call "$file" "$relative_file_path" "$output_pattern" "$PTC_FILE_TAG_NAME" "$additional_files_json"; then
+            if call_with_rate_limit_retry make_ptc_api_call "$file" "$relative_file_path" "$output_pattern" "$PTC_FILE_TAG_NAME" "$additional_files_json"; then
                 uploaded_files+=("$file")
                 log_success "Upload completed: $relative_file_path"
             else
@@ -985,7 +1071,7 @@ perform_status_action() {
 
     log_info "Status check completed for ${#checked_files[@]} file(s)"
 
-    # ci18-7342 - "still in progress" is a legitimate answer and stays exit 0,
+    # "still in progress" is a legitimate answer and stays exit 0,
     # but a terminal failure or an unreadable status must not. This used to
     # return 0 unconditionally, so a gate built on `--action status` passed
     # even when the translation had definitively failed.
@@ -1107,7 +1193,7 @@ process_files_in_steps() {
                 additional_files_json=$(extract_additional_files "$PTC_CONFIG_FILE" "$relative_file_path")
             fi
             
-            if make_ptc_api_call "$file" "$relative_file_path" "$output_file_path" "$PTC_FILE_TAG_NAME" "$additional_files_json"; then
+            if call_with_rate_limit_retry make_ptc_api_call "$file" "$relative_file_path" "$output_file_path" "$PTC_FILE_TAG_NAME" "$additional_files_json"; then
                 uploaded_files+=("$file")
                 log_success "Upload completed: $relative_file_path"
             else
@@ -1134,7 +1220,7 @@ process_files_in_steps() {
         else
             log_info "Starting processing: $relative_file_path"
             
-            if start_processing "$file" "$relative_file_path" "$PTC_FILE_TAG_NAME"; then
+            if call_with_rate_limit_retry start_processing "$file" "$relative_file_path" "$PTC_FILE_TAG_NAME"; then
                 processed_files+=("$file")
                 log_success "Processing started: $relative_file_path"
             else
@@ -1197,7 +1283,7 @@ process_files_in_steps() {
             if [[ $status_result -eq 0 ]]; then
                 # Translation completed, download it
                 set_file_status "$file" "completed"
-                # ci18-7342 - 2 means the archive is not ready yet (HTTP 202);
+                # 2 means the archive is not ready yet (HTTP 202);
                 # keep the file in the loop rather than failing it. Same
                 # handling as the config path.
                 local download_result=0
@@ -1288,7 +1374,7 @@ process_files_in_steps() {
         done
     fi
     
-    # ci18-7342 - a partial run is not a success. This used to return 0 as soon
+    # A partial run is not a success. This used to return 0 as soon
     # as ONE file completed, so nine failures out of ten still exited green and
     # the pipeline reported a translation run that never happened. Anything
     # failed or still unfinished is a non-zero exit; CI decides what to do with
@@ -1351,7 +1437,7 @@ process_files_in_steps_with_config() {
             local additional_files_json=""
             additional_files_json=$(extract_additional_files "$PTC_CONFIG_FILE" "$relative_file_path")
             
-            if make_ptc_api_call "$file" "$relative_file_path" "$output_pattern" "$PTC_FILE_TAG_NAME" "$additional_files_json"; then
+            if call_with_rate_limit_retry make_ptc_api_call "$file" "$relative_file_path" "$output_pattern" "$PTC_FILE_TAG_NAME" "$additional_files_json"; then
                 uploaded_files+=("$file")
                 log_success "Upload completed: $relative_file_path"
             else
@@ -1378,7 +1464,7 @@ process_files_in_steps_with_config() {
         else
             log_info "Starting processing: $relative_file_path"
             
-            if start_processing "$file" "$relative_file_path" "$PTC_FILE_TAG_NAME"; then
+            if call_with_rate_limit_retry start_processing "$file" "$relative_file_path" "$PTC_FILE_TAG_NAME"; then
                 processed_files+=("$file")
                 log_success "Processing started: $relative_file_path"
             else
@@ -1441,7 +1527,7 @@ process_files_in_steps_with_config() {
 
             case $file_action in
                 0)
-                    # ci18-7342 - a file counts as completed only once its
+                    # A file counts as completed only once its
                     # translations are actually on disk. This used to add it to
                     # completed_files BEFORE downloading and downgrade a failed
                     # download to a warning, so a run that fetched nothing still
@@ -1537,7 +1623,7 @@ process_files_in_steps_with_config() {
         done
     fi
     
-    # ci18-7342 - a partial run is not a success. This used to return 0 as soon
+    # A partial run is not a success. This used to return 0 as soon
     # as ONE file completed, so nine failures out of ten still exited green and
     # the pipeline reported a translation run that never happened. Anything
     # failed or still unfinished is a non-zero exit; CI decides what to do with
@@ -1727,19 +1813,14 @@ make_ptc_api_call() {
     
     log_debug "Uploading file to PTC API: $api_url"
     
-    # Prepare headers for authentication
-    local auth_header=""
+    # Log the auth posture; each curl invocation below inlines its own headers.
     if [[ -n "$PTC_API_TOKEN" ]]; then
-        auth_header="-H \"Authorization: Bearer $PTC_API_TOKEN\""
         log_debug "Using API token for authentication"
     else
         log_warning "No API token provided, request may fail"
     fi
-    
-    # Prepare additional curl parameters
-    local additional_curl_params=""
+
     if [[ -n "$additional_files_json" ]]; then
-        additional_curl_params="-F \"additional_translation_files=$additional_files_json\""
         log_debug "Including additional_translation_files: $additional_files_json"
     fi
 
@@ -1834,8 +1915,14 @@ EOF
     local http_code="${response: -3}"
     local response_body="${response%???}"
     
+    # Ask the caller to wait and try again rather than reporting a failed
+    # upload: nothing was uploaded, so this file is still worth retrying.
+    if [[ "$http_code" == "429" ]]; then
+        return $PTC_RATE_LIMITED
+    fi
+
     # A 201 that still carries "success": false is a rejected upload dressed as
-    # a created one - the content-validation path answers that way (ci18-7342).
+    # a created one - the content-validation path answers that way.
     if [[ "$http_code" == "201" ]] && ! response_indicates_failure "$http_code" "$response_body"; then
         log_success "File uploaded successfully: $relative_file_path"
         if [[ "$PTC_VERBOSE" == "true" ]]; then
@@ -1897,6 +1984,12 @@ start_processing() {
     local http_code="${response: -3}"
     local response_body="${response%???}"
     
+    # Same bucket as the upload above, so the same treatment: the file is
+    # uploaded but not yet processing, and only a retry can finish the job.
+    if [[ "$http_code" == "429" ]]; then
+        return $PTC_RATE_LIMITED
+    fi
+
     if response_indicates_failure "$http_code" "$response_body"; then
         log_error "Failed to start file processing: $relative_file_path ($(describe_api_failure "$http_code" "$response_body"))"
         log_debug "Process API response: $response_body"
@@ -1948,7 +2041,7 @@ get_translation_status_quiet() {
     log_debug "Response Body: $response_body"
     
     # A rejected status query answers 200-with-"success":false on older servers
-    # (ci18-7342); without this it parses as an absent status and polls on.
+    # without this it parses as an absent status and polls on.
     if [[ "$http_code" == "200" ]] && response_indicates_failure "$http_code" "$response_body"; then
         log_debug "Status query rejected: $(describe_api_failure "$http_code" "$response_body")"
         return 1
@@ -2025,7 +2118,7 @@ check_translation_status() {
     local http_code="${response: -3}"
     local response_body="${response%???}"
     
-    # Same two-shape rejection as elsewhere (ci18-7342): do not report a
+    # Same two-shape rejection as elsewhere: do not report a
     # rejected query as a retrieved status.
     if [[ "$http_code" == "200" ]] && response_indicates_failure "$http_code" "$response_body"; then
         log_error "Failed to check translation status: $relative_file_path ($(describe_api_failure "$http_code" "$response_body"))"
@@ -2312,7 +2405,7 @@ download_translations() {
     
     # curl wrote the body straight to $temp_zip, so on the older server shape a
     # rejected download lands here as a 200 whose "zip" is really the JSON error
-    # envelope. Read the file back before trusting the status (ci18-7342).
+    # envelope. Read the file back before trusting the status.
     local download_body=""
     if [[ -f "$temp_zip" ]] && [[ "$(head -c 1 "$temp_zip" 2>/dev/null)" == "{" ]]; then
         download_body=$(head -c 4096 "$temp_zip" 2>/dev/null)
@@ -2324,7 +2417,7 @@ download_translations() {
         return 1
     fi
 
-    # ci18-7342 - 202 is the API saying "the archive is not ready yet"
+    # 202 is the API saying "the archive is not ready yet"
     # (TranslationInProgressError, with a Retry-After header), not a download
     # error and not a terminal outcome. It happens routinely because
     # translation_status can report a file ready a moment before its archive
@@ -2675,7 +2768,7 @@ build_detect_payload() {
 call_detect_config() {
     local payload="$1"
     local response
-    # ci18-7276 - only send Authorization when a token exists. detect_config is
+    # Only send Authorization when a token exists. detect_config is
     # anonymous, so an empty "Bearer " header is pointless and, on a stricter
     # proxy, could be rejected as a malformed credential.
     #
@@ -2816,11 +2909,11 @@ detect_ci_provider() {
     fi
 }
 
-# ci18-7254 - the snippet runs through ptc-action rather than curling the CLI
+# The snippet runs through ptc-action rather than curling the CLI
 # itself. The action SHA-pins ptc-cli and third-party actions, ships the right
 # runner image, and is loop-safe (stable PR branch + a [skip translations]
 # guard) - none of which a hand-rolled curl step gets for free. This is the same
-# recipe the in-product token screen prints (ci18-7253), so the CLI, the product
+# recipe the product prints, so the CLI, the product
 # and the action README no longer drift. The CLI stays usable on its own - see
 # the standalone note print_ci_block adds below.
 render_ci_github() {
@@ -2869,7 +2962,11 @@ ptc-translate:
   rules:
     - if: '\$CI_PIPELINE_SOURCE == "push" && \$CI_COMMIT_BRANCH == \$CI_DEFAULT_BRANCH'
   before_script:
-    - apk add --no-cache bash curl git jq
+    # jq is never invoked by the CLI. unzip is - it unpacks the downloaded
+    # translations; alpine already provides it as a busybox applet, so it is
+    # named here only to keep the job working if the image is ever changed.
+    # git is needed by the push step below, not by the CLI.
+    - apk add --no-cache bash curl git unzip
   script:
     - curl -fsSL https://raw.githubusercontent.com/OnTheGoSystems/ptc-cli/v${VERSION}/ptc-cli.sh -o ptc-cli.sh
     - chmod +x ptc-cli.sh
@@ -2879,12 +2976,16 @@ ptc-translate:
     # > "Allow Git push requests to the repository" (GitLab 18.4+, off by
     # default). Otherwise set PTC_GIT_PUSH_TOKEN to a project access token with
     # the write_repository scope, as a masked CI/CD variable.
+    # \`git add -A\` comes BEFORE the check, and the check reads the index.
+    # On the first run the translations are new files, and a plain
+    # \`git diff\` only looks at tracked ones - it would report "nothing changed",
+    # skip the push, and leave a green job that produced no merge request.
     - |
-      if ! git diff --quiet; then
-        git config user.email "ci@ptc"
-        git config user.name "PTC Translate"
-        git checkout -B ptc/translations
-        git add -A
+      git config user.email "ci@ptc"
+      git config user.name "PTC Translate"
+      git checkout -B ptc/translations
+      git add -A
+      if ! git diff --cached --quiet; then
         git commit -m "chore(i18n): update translations via PTC [skip ci]"
         git push -o merge_request.create \\
                  -o merge_request.target="\$CI_DEFAULT_BRANCH" \\
@@ -2948,8 +3049,8 @@ OPTIONS:
     -h, --help             Show this help
 
 NOTE:
-    detect_config is currently on the QA environment. Until it reaches
-    production, point --api-url at the QA host."
+    detect_config is anonymous — init needs no API token. A token is only
+    required later, to upload and translate."
 }
 
 # `ptc init` entry point.
@@ -2998,8 +3099,8 @@ cmd_init() {
         return 1
     fi
 
-    # ci18-7276 - `ptc init` no longer requires a token. detect_config is
-    # anonymous (ci18-7275), and config generation is the step a developer runs
+    # `ptc init` requires no token. detect_config is
+    # anonymous, and config generation is the step a developer runs
     # BEFORE they have a token - so demanding one here blocked the exact
     # first-use path it exists to serve, including trial orgs that cannot mint a
     # token at all. A token, if present, is still forwarded (harmless; the
@@ -3038,7 +3139,7 @@ cmd_init() {
                 ;;
             404)
                 log_error "detect_config is not available on this server (HTTP 404)."
-                log_info "This endpoint is currently on the QA environment; point --api-url at the QA host."
+                log_info "Check --api-url. The endpoint is live on the default host; a self-hosted instance may predate it."
                 return 1
                 ;;
             ""|000)
