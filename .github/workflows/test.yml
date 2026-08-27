@@ -210,3 +210,12 @@ jobs:
       # docker and a 1.5 GB runner image - but this needs neither.
       - name: the observed path list behaves
         run: bash tests/translation-paths.test.sh
+
+      # The GitLab component runs on alpine - busybox ash before before_script
+      # installs bash - so this half is POSIX and is checked under both. dash
+      # stands in for ash here; the same suite runs under ash locally.
+      - name: the GitLab component commits only what the run wrote
+        run: |
+          set -euo pipefail
+          TEST_SHELL_LABEL=bash bash tests/gitlab-scope.test.sh
+          TEST_SHELL_LABEL=dash dash tests/gitlab-scope.test.sh
