@@ -1,0 +1,220 @@
+name: PTC pull-request scope and event gate
+
+# Behavioural cover for the two defects this fixture exists to pin down:
+#
+#   (a) the translation pull request carried the whole working directory, so
+#       anything the caller's job dirtied before the action - an install, a
+#       build, a codegen - shipped under a "translations" title;
+#   (b) on a pull_request event the pull request targeted `NN/merge`, GitHub's
+#       internal merge ref, which is not a branch.
+#
+# Everything here runs under act against a mock PTC API and a stub standing in
+# for create-pull-request; no network to PTC, no token, no pull request opened.
+#
+# NOTE: the `actions/checkout` step is load-bearing under act - act only copies
+# the host workdir into the job container when the job contains a local
+# checkout step. Without it `uses: ./ptc-action` cannot find action.yml.
+
+on:
+  push: {}
+  pull_request: {}
+  workflow_dispatch: {}
+
+jobs:
+  # (a) A job that builds before us must not have its build committed.
+  dirty-workspace:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: dirty the workspace the way a real caller's job does
+        run: |
+          mkdir -p dist
+          echo "console.log('build output')" > dist/bundle.js
+          echo '{"lockfileVersion": 3}' > package-lock.json
+          echo "a line an earlier step appended" >> README.md
+
+      - name: translate
+        uses: ./ptc-action
+        with:
+          api-token: ${{ secrets.PTC_API_TOKEN }}
+          api-url: ${{ vars.PTC_API_URL }}
+          create-pr: 'true'
+
+      - name: the pull request carries translations and nothing else
+        run: |
+          set -u
+          staged="${RUNNER_TEMP}/cpr-staged"
+          test -f "$staged" || { echo "::error::create-pull-request was never reached"; exit 1; }
+          echo "--- staged ---"; sed 's/^/  /' "$staged"
+
+          status=$(cat "${RUNNER_TEMP}/cpr-add-status")
+          if [ "$status" != "0" ]; then
+            echo "::error::git add rejected the path list (exit $status); it stages nothing at all when that happens"
+            exit 1
+          fi
+
+          rc=0
+          for want in locales/de.json locales/fr.json; do
+            grep -qx "$want" "$staged" || { echo "::error::$want is missing from the translation pull request"; rc=1; }
+          done
+          for unwanted in dist/bundle.js package-lock.json README.md; do
+            if grep -qx "$unwanted" "$staged"; then
+              echo "::error::$unwanted was swept into the translation pull request"
+              rc=1
+            fi
+          done
+          exit $rc
+
+  # The config's `output:` is not where translations land: the CLI sends it to
+  # the API and unpacks the archive next to the SOURCE file. A path list
+  # derived from `output:` therefore matched nothing here, and the run stayed
+  # green while committing not one translation.
+  output-points-elsewhere:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: 'a config whose output: points somewhere the CLI never writes'
+        run: |
+          cat > .ptc-config.yml <<'CFG'
+          source_locale: en
+          files:
+            - file: locales/en.json
+              output: public/i18n/{{lang}}.json
+          CFG
+
+      - name: translate
+        uses: ./ptc-action
+        with:
+          api-token: ${{ secrets.PTC_API_TOKEN }}
+          api-url: ${{ vars.PTC_API_URL }}
+          create-pr: 'true'
+
+      - name: the translations are committed from where they actually landed
+        run: |
+          set -u
+          staged="${RUNNER_TEMP}/cpr-staged"
+          test -f "$staged" || { echo "::error::create-pull-request was never reached"; exit 1; }
+          echo "--- on disk ---"; ls -la locales/
+          echo "--- staged ---";  sed 's/^/  /' "$staged"
+
+          if [ ! -s "$staged" ]; then
+            echo "::error::nothing was committed: the paths were derived from output: instead of observed on disk"
+            exit 1
+          fi
+          rc=0
+          for want in locales/de.json locales/fr.json; do
+            grep -qx "$want" "$staged" || { echo "::error::$want landed on disk but is missing from the pull request"; rc=1; }
+          done
+          exit $rc
+
+  # (b) On pull_request the run sits on the merge ref. The translations were
+  # produced from base+head, so they belong to neither branch on its own, and
+  # the action refuses rather than opening a pull request against a base that
+  # never contained those source strings.
+  pull-request-is-refused:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: the premise - this run really is on a merge ref
+        env:
+          REF_NAME: ${{ github.ref_name }}
+          BASE_REF: ${{ github.event.pull_request.base.ref }}
+        run: |
+          echo "ref_name=[$REF_NAME] base.ref=[$BASE_REF]"
+          case "$REF_NAME" in
+            */merge) echo "OK: on the merge ref, as a pull_request run is" ;;
+            *) echo "::error::this run is not on a merge ref; the test below would prove nothing"; exit 1 ;;
+          esac
+
+      - name: translate
+        id: run
+        continue-on-error: true
+        uses: ./ptc-action
+        with:
+          api-token: ${{ secrets.PTC_API_TOKEN }}
+          api-url: ${{ vars.PTC_API_URL }}
+          create-pr: 'true'
+
+      - name: no pull request was opened, and the refusal said why
+        run: |
+          set -u
+          if [ -f "${RUNNER_TEMP}/cpr-base" ]; then
+            echo "::error::a pull request was opened on a pull_request event, against base [$(cat "${RUNNER_TEMP}/cpr-base")]"
+            exit 1
+          fi
+          if [ "${{ steps.run.outcome }}" != "failure" ]; then
+            echo "::error::the action neither opened a pull request nor failed; a caller asking for one deserves an answer"
+            exit 1
+          fi
+          echo "OK: refused, and no pull request was opened"
+
+  # A run that writes nothing must open nothing. This is the sharpest edge in
+  # the change: create-pull-request treats an empty add-paths as `git add -A`,
+  # so if the step is not skipped here it commits the caller's whole repository.
+  nothing-written-opens-no-pull-request:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: translate once, so the translations are already on disk
+        uses: ./ptc-action
+        with:
+          api-token: ${{ secrets.PTC_API_TOKEN }}
+          api-url: ${{ vars.PTC_API_URL }}
+          create-pr: 'true'
+
+      - name: commit them, and forget what the stub recorded
+        run: |
+          set -eu
+          git config user.email probe@local
+          git config user.name probe
+          git add -A
+          git commit -qm "translations from the first run"
+          rm -f "${RUNNER_TEMP}"/cpr-*
+
+      - name: translate again - same content, nothing new written
+        uses: ./ptc-action
+        with:
+          api-token: ${{ secrets.PTC_API_TOKEN }}
+          api-url: ${{ vars.PTC_API_URL }}
+          create-pr: 'true'
+
+      - name: no pull request, and above all no commit of the whole repository
+        run: |
+          set -u
+          if [ -f "${RUNNER_TEMP}/cpr-staged" ]; then
+            echo "::error::create-pull-request ran for a run that wrote nothing; it would have staged:"
+            sed 's/^/  /' "${RUNNER_TEMP}/cpr-staged"
+            exit 1
+          fi
+          echo "OK: the pull request step was skipped"
+
+  # The gate must refuse the merge ref without refusing the supported path.
+  push-still-opens-a-pull-request:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: translate
+        uses: ./ptc-action
+        with:
+          api-token: ${{ secrets.PTC_API_TOKEN }}
+          api-url: ${{ vars.PTC_API_URL }}
+          create-pr: 'true'
+
+      - name: the pull request targets the branch that was pushed
+        env:
+          REF_NAME: ${{ github.ref_name }}
+        run: |
+          set -u
+          base="$(cat "${RUNNER_TEMP}/cpr-base")"
+          echo "base=[$base] ref_name=[$REF_NAME]"
+          test -n "$base" || { echo "::error::no pull request was opened on push"; exit 1; }
+          test "$base" = "$REF_NAME" || { echo "::error::base [$base] is not the pushed branch [$REF_NAME]"; exit 1; }
+          case "$base" in
+            */merge) echo "::error::base is a merge ref"; exit 1 ;;
+          esac
+          echo "OK: pull request targets [$base]"

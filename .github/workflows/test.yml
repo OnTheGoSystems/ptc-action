@@ -18,6 +18,11 @@ jobs:
       - name: shellcheck the vendored CLI
         run: shellcheck ptc-cli.sh || true   # advisory: the CLI is owned upstream
 
+      # Not advisory: this one is ours, and it ships into every consumer's
+      # runner. SC1091 only says the test cannot follow its own `source`.
+      - name: shellcheck what we wrote
+        run: shellcheck --exclude=SC1091 lib/*.sh tests/*.sh tests/act/run.sh
+
       - name: vendored CLI matches the pinned version
         run: |
           set -euo pipefail
@@ -37,8 +42,9 @@ jobs:
           # set, the action runs `ptc init` itself and uses what it detects.
           for optional in ('config-file', 'source-locale', 'patterns'):
               assert a['inputs'][optional].get('required', False) is False, f'{optional} must stay optional'
-          run = a['runs']['steps'][0]['run']
-          assert 'init --yes' in run, 'the action must be able to detect the layout itself'
+          steps = a['runs']['steps']
+          translate = next(s for s in steps if s.get('id') == 'ptc')
+          assert 'init --yes' in translate['run'], 'the action must be able to detect the layout itself'
           print('action.yml OK:', a['name'])
           PY
 
@@ -127,3 +133,80 @@ jobs:
                        'cross-instance:\n  ' + '\n  '.join(bad))
           print('no component address handed out — OK')
           PY
+
+      # A translation PR must contain translations. `add-paths: '.'` committed
+      # whatever else the caller's job had left dirty in the workspace, and
+      # `base: github.ref_name` is `NN/merge` on a pull_request event - an
+      # internal ref, not a branch, so the PR targeted a base that never
+      # existed. These are shape checks; tests/translation-paths.test.sh and
+      # tests/act/ cover the behaviour.
+      - name: the translation PR is scoped, and only opened where a base branch exists
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          import yaml
+          steps = yaml.safe_load(open('action.yml'))['runs']['steps']
+          cpr = next(s for s in steps if s.get('id') == 'cpr')
+          translate = next(s for s in steps if s.get('id') == 'ptc')
+          with_block = cpr['with']
+
+          add_paths = str(with_block['add-paths'])
+          assert add_paths.strip() != '.', (
+              'add-paths commits the whole workspace; scope it to translation output')
+          assert 'steps.ptc.outputs.add-paths' in add_paths, (
+              'add-paths must come from the paths the translate step observed')
+
+          # An empty add-paths makes create-pull-request fall back to `git add
+          # -A`, so "we wrote nothing" would commit the caller's workspace.
+          assert "steps.ptc.outputs.add-paths != ''" in str(cpr['if']), (
+              'the pull request step must be skipped when nothing was written')
+
+          # The paths must be observed on disk. Reading them out of the config
+          # cannot work: `output:` is sent to the API, while the CLI unpacks
+          # next to the source file.
+          assert 'lib/translation-paths.sh' in translate['run'], (
+              'the written paths must be observed, not derived from the config')
+          assert 'ptc_snapshot_worktree' in translate['run'], (
+              'the working tree must be snapshotted before the run, so what the '
+              'run wrote can be told from what the caller left behind')
+          assert 'RUN_MARKER' not in translate['run'], (
+              'a timestamp comparison drops translations unpacked from a ZIP, '
+              'whose mtimes come from the archive')
+          assert "'^ *output:'" not in translate['run'], (
+              "the config's output: entries are not where translations land - the "
+              "CLI unpacks next to the source file - so the path list must not be "
+              "scraped out of the config again")
+
+          gate = next((s for s in steps if s.get('id') == 'gate'), None)
+          assert gate is not None, 'no event gate step found'
+          for event in ('pull_request', 'pull_request_target', 'merge_group'):
+              assert event in gate['run'], f'the gate must refuse {event}'
+          assert 'REF_TYPE' in gate['run'], (
+              'the gate must refuse a tag, where ref_name is not a branch')
+          assert steps.index(gate) < steps.index(translate), (
+              'the gate must run before the CLI: a refusal after translating bills the caller')
+
+          # Assembled, never spelled: everything inside a run body is
+          # interpolated before bash sees it, so a literal here would be
+          # replaced by the branch name and the comparison could never hold.
+          # Same reason as the OPEN above.
+          expected_base = '$' + '{{ github.ref_name }' + '}'
+          base = str(with_block['base'])
+          assert base.strip() == expected_base, (
+              'with the gate in place base is the pushed branch; anything else '
+              'reintroduces the merge-ref question the gate settles')
+
+          # Every input the script reads must arrive through env, never
+          # interpolated into the body - the guard above enforces the second
+          # half, this one keeps the first honest for the input added here.
+          assert 'INPUT_CREATE_PR' in translate['env'], (
+              'create-pr must reach the script through env, like every other input')
+          assert 'add-paths<<' in translate['run'], (
+              'the translate step must publish the add-paths output')
+          print('translation PR scope, event gate and base OK')
+          PY
+
+      # The behavioural half of the above. act is not run here - it needs
+      # docker and a 1.5 GB runner image - but this needs neither.
+      - name: the observed path list behaves
+        run: bash tests/translation-paths.test.sh

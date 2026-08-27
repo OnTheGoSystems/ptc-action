@@ -1,0 +1,14 @@
+{
+  "action": "synchronize",
+  "number": 42,
+  "pull_request": {
+    "number": 42,
+    "base": { "ref": "main", "sha": "0000000000000000000000000000000000000000" },
+    "head": { "ref": "feature/add-strings", "sha": "1111111111111111111111111111111111111111" }
+  },
+  "repository": {
+    "name": "fixture",
+    "full_name": "example/fixture",
+    "default_branch": "main"
+  }
+}

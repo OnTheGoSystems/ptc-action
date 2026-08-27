@@ -1,0 +1,91 @@
+name: 'create-pull-request (stub)'
+description: 'Stands in for peter-evans/create-pull-request under act: records what would be committed, opens nothing.'
+
+# act redirects the real action to this one via --local-repository, matched on
+# the exact SHA pinned in ../../../action.yml. Change the pin there without
+# changing it in run.sh and act will try to clone the real thing instead of
+# using this stub - the mismatch fails loudly rather than testing nothing.
+#
+# The staging half is reproduced faithfully, because that is what is under
+# test. Upstream (src/create-or-update-branch.ts) runs, with no shell in
+# between:
+#
+#     git add -- <paths>          when add-paths is non-empty
+#     git add -A                  when it is empty
+#
+# splitting the input on /[\n,]+/ and trimming. `git add` dies on the first
+# pathspec that matches nothing and stages NOTHING at all when it does -
+# upstream then ignores that exit code and fails later with an empty message.
+# The stub records the exit code so a test can see the difference.
+
+inputs:
+  token:            { required: false, default: '' }
+  branch:           { required: false, default: '' }
+  base:             { required: false, default: '' }
+  title:            { required: false, default: '' }
+  commit-message:   { required: false, default: '' }
+  body:             { required: false, default: '' }
+  delete-branch:    { required: false, default: 'false' }
+  add-paths:        { required: false, default: '' }
+
+outputs:
+  pull-request-number:
+    description: 'Fixed, so the caller can prove the outputs are wired through.'
+    value: '4242'
+  pull-request-url:
+    description: 'Fixed, as above.'
+    value: 'https://example.invalid/pull/4242'
+
+runs:
+  using: 'composite'
+  steps:
+    - shell: bash
+      env:
+        STUB_BASE: ${{ inputs.base }}
+        STUB_BRANCH: ${{ inputs.branch }}
+        STUB_ADD_PATHS: ${{ inputs.add-paths }}
+      run: |
+        set -uo pipefail
+
+        # RUNNER_TEMP, never the workspace: with the old add-paths: '.' the
+        # stub's own bookkeeping ended up staged and polluted the very
+        # observation it exists to make.
+        out="${RUNNER_TEMP:-/tmp}"
+        printf '%s' "$STUB_BASE"   > "$out/cpr-base"
+        printf '%s' "$STUB_BRANCH" > "$out/cpr-branch"
+        printf '%s' "$STUB_ADD_PATHS" > "$out/cpr-add-paths"
+
+        echo "stub create-pull-request: base=[$STUB_BASE] branch=[$STUB_BRANCH]"
+        echo "stub create-pull-request: add-paths=["
+        printf '%s\n' "$STUB_ADD_PATHS" | sed 's/^/  /'
+        echo "]"
+
+        git config --global --add safe.directory "$PWD" 2>/dev/null || true
+
+        paths=()
+        while IFS= read -r line; do
+          line="${line#"${line%%[![:space:]]*}"}"
+          line="${line%"${line##*[![:space:]]}"}"
+          [ -n "$line" ] && paths+=("$line")
+        # printf '%s\n', not '%s': without the trailing newline `read` returns
+        # false on the last line and the loop body never runs for it - with a
+        # single-line input that means no paths at all, and the stub would fall
+        # through to `git add -A` and report a clean pass for a broken list.
+        done < <(printf '%s\n' "$STUB_ADD_PATHS" | tr ',' '\n')
+
+        if [ "${#paths[@]}" -eq 0 ]; then
+          git add -A
+        else
+          git add -- "${paths[@]}"
+        fi
+        add_status=$?
+        echo "$add_status" > "$out/cpr-add-status"
+        echo "stub create-pull-request: git add exited $add_status"
+
+        git diff --cached --name-only > "$out/cpr-staged"
+        echo "stub create-pull-request: would commit:"
+        sed 's/^/  /' "$out/cpr-staged"
+
+        # Always succeed: this stub reports, it does not judge. The assertions
+        # live in the fixture workflow, where a failure names what went wrong.
+        exit 0
