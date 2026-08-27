@@ -39,11 +39,11 @@ spec:
       description: 'How many polls before giving up. CLI default is 100 (~8 min at the default interval); a run that needs longer exits 1 with the unfinished files listed.'
       default: ''
     cli-ref:
-      description: 'ptc-cli git ref to fetch. Defaults to the immutable commit behind v1.0.4 — a tag can be moved, a commit cannot.'
-      default: '82beb580f144214ad6b3f5a872fcd4f40814b3f2'
+      description: 'ptc-cli git ref to fetch. Defaults to the immutable commit behind v1.0.5 — a tag can be moved, a commit cannot.'
+      default: '35217510e17c6659f22a44f5191c2c3cdc37b965'
     cli-sha256:
       description: 'Expected sha256 of ptc-cli.sh. Verified after download; set to an empty string to skip (only if you also override cli-ref).'
-      default: '29f66e8a3b89521e8e1e6a1e91e3a6ea014c6258da8518ac0694cb6cf5694945'
+      default: 'd5b1b2c62c530f43d76aa924e399548379369e458955a31bd11539580d71428d'
     open-mr:
       description: 'Open a merge request with the translations via the git push option.'
       default: 'false'

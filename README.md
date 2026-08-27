@@ -7,7 +7,7 @@ Translate your source files with **[Private Translation Cloud](https://ptc.wpml.
 
 There is no GitHub Marketplace listing. `uses:` resolves against the repository, so the reference above works without one.
 
-This action **vendors** [`ptc-cli` v1.0.4](https://github.com/OnTheGoSystems/ptc-cli/tree/v1.0.4) inside the action repo, so it never runs `main` at job time — the script that ships with a given action tag is the script that runs.
+This action **vendors** [`ptc-cli` v1.0.5](https://github.com/OnTheGoSystems/ptc-cli/tree/v1.0.5) inside the action repo, so it never runs `main` at job time — the script that ships with a given action tag is the script that runs.
 
 ---
 
@@ -63,15 +63,44 @@ There is no GitLab component. `include: component:` is resolved by **your own** 
 ptc-translate:
   stage: deploy
   image: alpine:3.22
+  # Loop-safe twice over: the job only runs on a push to the default branch (the
+  # translation push targets ptc/translations, so it cannot retrigger this job),
+  # and rules: below refuses a commit marked [skip translations].
   rules:
-    - if: '$CI_PIPELINE_SOURCE == "push" && $CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH'
+    # The second condition is what keeps this loop-safe, and it has to live
+    # here: GitLab evaluates rules: against the commit message, whereas
+    # `[skip ci]` in the message would suppress the pipeline of the merge
+    # request itself - leaving the translations untested and, with "Pipelines
+    # must succeed" enabled, unmergeable.
+    - if: '$CI_PIPELINE_SOURCE == "push" && $CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH && $CI_COMMIT_MESSAGE !~ /\[skip translations\]/'
   before_script:
+    # jq is never invoked by the CLI. unzip is - it unpacks the downloaded
+    # translations; alpine already provides it as a busybox applet, so it is
+    # named here only to keep the job working if the image is ever changed.
+    # git is needed by the push step below, not by the CLI.
     - apk add --no-cache bash curl git unzip
   script:
-    - curl -fsSL https://raw.githubusercontent.com/OnTheGoSystems/ptc-cli/v1.0.4/ptc-cli.sh -o ptc-cli.sh
-    - chmod +x ptc-cli.sh
-    - ./ptc-cli.sh --config-file .ptc-config.yml
-    # `git add -A` comes BEFORE the check, and the check reads the index. On the
+    # Downloaded OUTSIDE the checkout: anything this job writes into the working
+    # tree is a file the commit below could sweep into the merge request, and
+    # the CLI is 100+ KB of it.
+    - curl -fsSL https://raw.githubusercontent.com/OnTheGoSystems/ptc-cli/v1.0.5/ptc-cli.sh -o /tmp/ptc-cli.sh
+    - chmod +x /tmp/ptc-cli.sh
+    - rm -f /tmp/ptc-written
+    - /tmp/ptc-cli.sh --config-file .ptc-config.yml --written-manifest /tmp/ptc-written
+    # Pushing needs a token that may write to the repository. CI_JOB_TOKEN can,
+    # but ONLY if a maintainer turns on Settings > CI/CD > Job token permissions
+    # > "Allow Git push requests to the repository" (GitLab 18.4+, off by
+    # default). Otherwise set PTC_GIT_PUSH_TOKEN to a project access token with
+    # the write_repository scope, as a masked CI/CD variable.
+    # Staged from the manifest, so the merge request carries the translations and
+    # nothing else - not this job's downloads, not whatever an earlier step in
+    # your pipeline left in the working directory.
+    #
+    # `|| true` is not cosmetic: if a translation lands on a path your
+    # .gitignore covers, git exits 1 while still staging everything else, and
+    # GitLab would abort the job on that exit code alone.
+    #
+    # Staging comes BEFORE the check, and the check reads the index: on the
     # first run the translations are new files, and a plain `git diff` only
     # looks at tracked ones - it would report "nothing changed", skip the push,
     # and leave a green job that produced no merge request.
@@ -79,9 +108,9 @@ ptc-translate:
       git config user.email "ci@ptc"
       git config user.name "PTC Translate"
       git checkout -B ptc/translations
-      git add -A
+      git add --pathspec-from-file=/tmp/ptc-written --pathspec-file-nul || true
       if ! git diff --cached --quiet; then
-        git commit -m "chore(i18n): update translations via PTC [skip ci]"
+        git commit -m "chore(i18n): update translations via PTC [skip translations]"
         git push -o merge_request.create \
                  -o merge_request.target="$CI_DEFAULT_BRANCH" \
                  -o merge_request.title="Update translations from PTC" \
@@ -97,10 +126,10 @@ On the `before_script` line: `bash` and `curl` are what a bare `alpine:3.22` lac
 
 Loop-safe twice over: the job only runs on a push to the default branch — the translation push targets `ptc/translations`, so it cannot re-trigger — and the commit carries `[skip ci]`, the only skip token GitLab honours.
 
-Pin `v1.0.4` to a different release if you want, and add a `sha256sum` check to get the same integrity guarantee the GitHub action gets from vendoring:
+Pin `v1.0.5` to a different release if you want, and add a `sha256sum` check to get the same integrity guarantee the GitHub action gets from vendoring:
 
 ```
-29f66e8a3b89521e8e1e6a1e91e3a6ea014c6258da8518ac0694cb6cf5694945  ptc-cli.sh
+d5b1b2c62c530f43d76aa924e399548379369e458955a31bd11539580d71428d  ptc-cli.sh
 ```
 
 <details>
