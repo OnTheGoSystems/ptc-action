@@ -65,6 +65,65 @@ outputs:
 runs:
   using: 'composite'
   steps:
+    # Refuse before the CLI runs, not after: a translation costs credits and
+    # minutes, and a caller who asked for a pull request should not pay for one
+    # that cannot be opened.
+    #
+    # `github.ref_name` is the branch on push and schedule, and that is the only
+    # shape create-pull-request can use. Elsewhere it is not a branch at all:
+    #
+    #   pull_request / pull_request_target
+    #       The run sits on `NN/merge`, GitHub's internal merge ref. Worse than
+    #       unusable: the translations were produced from base+head, so they
+    #       cover source strings that exist in neither branch on its own.
+    #       Opening the pull request against the base branch - which is what
+    #       reading it off the event would do - quietly proposes translations
+    #       for strings the base has never seen, and create-pull-request
+    #       cherry-picks them with `--strategy-option=theirs`, so a conflict
+    #       does not even stop it. Basing it on the head branch instead is a
+    #       different feature: it needs a per-pull-request `pr-branch`, because
+    #       create-pull-request matches an existing pull request on head AND
+    #       base, and a fork's head branch is not ours to push to.
+    #   merge_group
+    #       `gh-readonly-queue/<base>/pr-N-<sha>` is real but temporary: it is
+    #       deleted when the queue resolves, orphaning the pull request.
+    #   release, a tag push, workflow_dispatch on a tag
+    #       `ref_name` is the tag. The local half succeeds and the branch is
+    #       pushed before the API answers 422 for a base that is not a branch.
+    - name: Check this event can carry a translation pull request
+      id: gate
+      if: ${{ inputs.create-pr == 'true' }}
+      shell: bash
+      env:
+        EVENT_NAME: ${{ github.event_name }}
+        REF_TYPE: ${{ github.ref_type }}
+        REF_NAME: ${{ github.ref_name }}
+      run: |
+        set -euo pipefail
+        case "$EVENT_NAME" in
+          pull_request)
+            echo "::error::PTC will not open a translation pull request on a pull_request event. This run is on the merge ref ($REF_NAME), so the translations cover strings that exist in neither the base nor the head branch on its own, and any pull request opened from here targets a branch that never contained them. Run PTC on a push to your source branch instead, or set create-pr: 'false' here."
+            exit 1 ;;
+          pull_request_target)
+            # Not the merge ref: on this event the checkout is the base branch,
+            # and $REF_NAME is a real branch, so a pull request would open. The
+            # objection is what it would carry. pull_request_target runs with a
+            # write-scoped token against the base repository while the workspace
+            # can hold a fork's content, so committing from here writes a
+            # contributor's files into a branch of the base repository under
+            # our name. This one worked before and is withdrawn deliberately.
+            echo "::error::PTC will not open a translation pull request on a pull_request_target event. That event runs with write access to this repository while the workspace can contain a fork's files, so a pull request opened here would commit contributor-controlled content into $REF_NAME under the workflow's own token. Translate on a push to your source branch instead, or set create-pr: 'false' here."
+            exit 1 ;;
+          merge_group)
+            echo "::error::PTC will not open a translation pull request on a merge_group event: $REF_NAME is a temporary queue branch that is deleted when the merge queue resolves, which would orphan the pull request. Run PTC on a push to your source branch instead, or set create-pr: 'false' here."
+            exit 1 ;;
+        esac
+        if [ "$REF_TYPE" != "branch" ]; then
+          echo "::error::PTC will not open a translation pull request here: a pull request needs a base branch, and this run is not on one (ref_type='${REF_TYPE:-unknown}', ref='${REF_NAME:-unknown}'). A tag or a release is the usual reason. Run PTC on a push to a branch instead, or set create-pr: 'false' here."
+          exit 1
+        fi
+        echo "Event $EVENT_NAME on branch $REF_NAME can carry a translation pull request."
+
     - name: Translate with PTC
       id: ptc
       shell: bash
@@ -84,10 +143,25 @@ runs:
         INPUT_MONITOR_INTERVAL: ${{ inputs.monitor-interval }}
         INPUT_MONITOR_MAX_ATTEMPTS: ${{ inputs.monitor-max-attempts }}
         ACTION_PATH: ${{ github.action_path }}
-        INPUT_PROJECT_DIR: ${{ inputs.project-dir }}
+        INPUT_CREATE_PR: ${{ inputs.create-pr }}
       run: |
         set -euo pipefail
         echo "::add-mask::${PTC_API_TOKEN}"
+
+        # Record the working tree before anything runs, so that afterwards the
+        # files this run wrote can be told from what the caller's job left
+        # behind. `ptc init` runs after this line on purpose - a config it
+        # writes counts as ours and reaches the pull request, as it did when
+        # the whole workspace was committed.
+        #
+        # Only when a pull request was asked for: the snapshot needs a git
+        # repository, and translating without one is otherwise fine.
+        RUN_SNAPSHOT=""
+        if [ "${INPUT_CREATE_PR:-false}" = "true" ]; then
+          . "$ACTION_PATH/lib/translation-paths.sh"
+          RUN_SNAPSHOT="$(mktemp "${RUNNER_TEMP:-/tmp}/ptc-worktree.XXXXXX")"
+          ptc_snapshot_worktree "$RUN_SNAPSHOT"
+        fi
         CLI="$ACTION_PATH/ptc-cli.sh"   # vendored + pinned, never curled at runtime
         chmod +x "$CLI"
 
@@ -144,53 +218,69 @@ runs:
         # The pull request must carry translation output and nothing else.
         # Committing the whole workspace sweeps in anything the caller's job
         # left dirty before us - a build, a codegen, a lockfile rewritten by an
-        # install - and ships it under our name. Scope the commit to the same
-        # paths the translation was written to: the config's `output:` entries,
-        # or the inline patterns when the caller spelled them out.
-        RAW_PATHS=""
-        if [ -n "$CONFIG" ] && [ -f "$CONFIG" ]; then
-          RAW_PATHS=$(grep -A999 '^files:' "$CONFIG" | grep '^ *output:' | sed 's/^ *output: *//' || true)
-        elif [ -n "$PATTERNS" ]; then
-          RAW_PATHS=$(printf '%s' "$PATTERNS" | tr ',' '\n')
-        fi
-
-        # create-pull-request resolves paths from the repository root, while the
-        # CLI ran in project-dir, so anything but "." needs the prefix back.
-        PREFIX=""
-        case "${INPUT_PROJECT_DIR:-.}" in
-          ""|".") PREFIX="" ;;
-          *)      PREFIX="${INPUT_PROJECT_DIR%/}/" ;;
-        esac
-
+        # install - and ships it under our name.
+        #
+        # Which paths those are is OBSERVED, not derived from the config. The
+        # config's `output:` looks like the answer and is not: the CLI sends it
+        # to the API as `output_file_path` and unpacks the returned archive
+        # next to the SOURCE file, by basename. A config whose `output:` points
+        # anywhere else yields a list matching nothing - and `git add` dies on
+        # the first non-matching pathspec, staging nothing at all, after which
+        # create-pull-request commits an empty index and fails with the literal
+        # message "Unexpected error: ". Observation also picks up what no
+        # config-derived list could: the `path:` entries of
+        # `additional_translation_files:`, a monorepo where the CLI finds
+        # sources at any depth, and a locale written for the first time.
+        #
+        # Content, not timestamps: the CLI unpacks translations from a ZIP,
+        # ZIP stores mtimes to two seconds, and unzip restores them from the
+        # archive - so a translation written moments ago can be dated before
+        # the run started.
         ADD_PATHS=""
-        while IFS= read -r out_path; do
-          out_path="${out_path#"${out_path%%[![:space:]]*}"}"
-          out_path="${out_path%"${out_path##*[![:space:]]}"}"
-          [ -z "$out_path" ] && continue
-          # {{lang}} is the CLI's language slot; a glob covers every locale it wrote.
-          out_path="${out_path//\{\{lang\}\}/*}"
-          ADD_PATHS="${ADD_PATHS}${ADD_PATHS:+$'\n'}${PREFIX}${out_path}"
-        done <<< "$RAW_PATHS"
+        if [ -n "$RUN_SNAPSHOT" ]; then
+          ADD_PATHS="$(ptc_translation_paths "$RUN_SNAPSHOT")"
+          rm -f "$RUN_SNAPSHOT"
+        fi
 
         if [ -z "$ADD_PATHS" ]; then
-          # Keep the old behaviour rather than silently committing nothing, but
-          # say so - a PR from here may carry more than translations.
-          echo "::warning::Could not determine the translation output paths; the pull request will include every change in the workspace."
-          ADD_PATHS="."
+          # Nothing was written, so there is nothing to open a pull request
+          # about. Saying so beats the old fallback, which asked
+          # create-pull-request to stage the entire repository.
+          if [ -n "$(git status --porcelain --ignored 2>/dev/null | grep '^!!' || true)" ]; then
+            echo "This run produced no change git can commit. Some paths here are covered by .gitignore - if that includes where translations are written, git cannot put them in a pull request."
+          else
+            echo "This run produced no change git can see, so there is nothing to open a pull request about."
+          fi
+        else
+          echo "Translation output staged for the pull request:"
+          printf '%s\n' "$ADD_PATHS" | sed 's/^/  /'
         fi
 
-        echo "Translation paths staged for the pull request:"
-        printf '%s\n' "$ADD_PATHS" | sed 's/^/  /'
-
-        {
-          echo "add-paths<<PTC_ADD_PATHS_EOF"
-          printf '%s\n' "$ADD_PATHS"
-          echo "PTC_ADD_PATHS_EOF"
-        } >> "$GITHUB_OUTPUT"
+        if [ -z "$ADD_PATHS" ]; then
+          # The plain empty form, not an empty heredoc body: a heredoc whose
+          # body is one blank line leaves the output holding a newline, and
+          # whether the runner trims that is not something to bet the caller's
+          # repository on - `add-paths` that arrives as whitespace makes
+          # create-pull-request fall back to `git add -A`.
+          echo "add-paths=" >> "$GITHUB_OUTPUT"
+        else
+          # A random delimiter, because the values are file names: a repository
+          # containing a file named after a fixed delimiter could otherwise
+          # close the block early and append whatever it liked to the outputs.
+          DELIM="PTC_ADD_PATHS_$(od -An -tx1 -N16 /dev/urandom | tr -d ' \n')"
+          {
+            echo "add-paths<<$DELIM"
+            printf '%s\n' "$ADD_PATHS"
+            echo "$DELIM"
+          } >> "$GITHUB_OUTPUT"
+        fi
 
     - name: Create/update translation pull request
       id: cpr
-      if: ${{ inputs.create-pr == 'true' }}
+      # An empty add-paths means the run wrote nothing. Skipping is not a
+      # detail: create-pull-request treats an empty add-paths as `git add -A`,
+      # so the alternative is committing the caller's entire workspace.
+      if: ${{ inputs.create-pr == 'true' && steps.ptc.outputs.add-paths != '' }}
       # Pinned to a full commit SHA, not a floating major tag: a mutable tag on a
       # third-party action is a write-access foothold in every consumer's repo.
       # v8 needs Actions Runner >= v2.327.1 (Node 24) on self-hosted runners.
@@ -198,11 +288,12 @@ runs:
       with:
         token: ${{ inputs.pr-token != '' && inputs.pr-token || github.token }}
         branch: ${{ inputs.pr-branch }}
-        # On a pull_request event github.ref_name is `NN/merge`, an internal
-        # ref that is not a branch, so a PR opened against it targets a base that
-        # does not exist. The event carries the real base branch; fall back to
-        # ref_name for push and schedule, where it is already correct.
-        base: ${{ github.event.pull_request.base.ref || github.ref_name }}
+        # Plain ref_name, because the step above has already refused every
+        # event where it is not a branch. Reading the base off the event
+        # instead would make `pull_request` runs look supported while
+        # proposing translations to a branch that never had the source
+        # strings - see the gate for why that is worse than refusing.
+        base: ${{ github.ref_name }}
         title: 'Update translations from PTC'
         commit-message: 'chore(i18n): update translations via PTC [skip translations]'
         body: |
