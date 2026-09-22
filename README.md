@@ -1,5 +1,12 @@
 # PTC Translate
 
+> **Source of truth: `action/` in `ci18n/private-translation-cloud`.**
+> This directory is where the action is developed and gated (`action-tests`
+> and `component-vendor-check` in `.gitlab-ci/component-tests.yml`). It is
+> published to <https://github.com/OnTheGoSystems/ptc-action> by the release
+> job on tags matching `action/vX.Y.Z` (cut by hand on `release`; the floating `v1` is moved onto the same commit); the GitHub repository is a publish
+> target, not a place to commit. `ptc-cli.sh` here is vendored from `cli/`.
+
 Translate your source files with **[Private Translation Cloud](https://ptc.wpml.org) (WPML)** straight from CI — and get the results back as a self-updating pull request on every source push. PTC never touches your repo; the action runs the pinned [`ptc-cli`](https://github.com/OnTheGoSystems/ptc-cli) in **your** pipeline and your own token opens the PR.
 
 - **GitHub:** a composite action, used straight from this repository — `uses: OnTheGoSystems/ptc-action@v1`
@@ -7,7 +14,7 @@ Translate your source files with **[Private Translation Cloud](https://ptc.wpml.
 
 There is no GitHub Marketplace listing. `uses:` resolves against the repository, so the reference above works without one.
 
-This action **vendors** [`ptc-cli` v1.0.5](https://github.com/OnTheGoSystems/ptc-cli/tree/v1.0.5) inside the action repo, so it never runs `main` at job time — the script that ships with a given action tag is the script that runs.
+This action **vendors** [`ptc-cli` v1.0.6](https://github.com/OnTheGoSystems/ptc-cli/tree/v1.0.6) inside the action repo, so it never runs `main` at job time — the script that ships with a given action tag is the script that runs.
 
 ---
 
@@ -83,7 +90,7 @@ ptc-translate:
     # Downloaded OUTSIDE the checkout: anything this job writes into the working
     # tree is a file the commit below could sweep into the merge request, and
     # the CLI is 100+ KB of it.
-    - curl -fsSL https://raw.githubusercontent.com/OnTheGoSystems/ptc-cli/v1.0.5/ptc-cli.sh -o /tmp/ptc-cli.sh
+    - curl -fsSL https://raw.githubusercontent.com/OnTheGoSystems/ptc-cli/v1.0.6/ptc-cli.sh -o /tmp/ptc-cli.sh
     - chmod +x /tmp/ptc-cli.sh
     - rm -f /tmp/ptc-written
     - /tmp/ptc-cli.sh --config-file .ptc-config.yml --written-manifest /tmp/ptc-written
