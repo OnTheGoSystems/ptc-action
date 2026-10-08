@@ -14,16 +14,16 @@ Translate your source files with **[Private Translation Cloud](https://ptc.wpml.
 
 There is no GitHub Marketplace listing. `uses:` resolves against the repository, so the reference above works without one.
 
-This action **vendors** [`ptc-cli` v1.0.6](https://github.com/OnTheGoSystems/ptc-cli/tree/v1.0.6) inside the action repo, so it never runs `main` at job time — the script that ships with a given action tag is the script that runs.
+This action **vendors** [`ptc-cli` v1.3.1](https://github.com/OnTheGoSystems/ptc-cli/tree/v1.3.1) inside the action repo, so it never runs `main` at job time — the script that ships with a given action tag is the script that runs.
 
 ---
 
 ## Quick start (GitHub Actions)
 
-**1. Get a token.** Grab your PTC project token. A config is optional: with none, the action detects your layout at run time (see [Inputs](#inputs-github-action)). To see and commit the detected layout up front, run [`ptc init`](https://github.com/OnTheGoSystems/ptc-cli) in a checkout of your repo — it needs no token — and commit the `.ptc-config.yml` it writes.
+**1. Get a token.** Grab your PTC API token (your agent token when the agent guide set this repository up; a project token otherwise). A config is optional: with none, the action detects your layout at run time (see [Inputs](#inputs-github-action)). To see and commit the detected layout up front, run [`ptc init`](https://github.com/OnTheGoSystems/ptc-cli) in a checkout of your repo — it needs no token — and commit the `.ptc-config.yml` it writes.
 
 **2. Add secrets.** Repo → Settings → Secrets and variables → Actions:
-- `PTC_API_TOKEN` — your PTC project token (**required**).
+- `PTC_API_TOKEN` — your PTC API token (**required**): your agent token (one secret for every product in the repository) or a project token.
 - `PTC_PR_TOKEN` — *(recommended)* a PAT or GitHub App token so the translation PR triggers your other CI checks. A bare `GITHUB_TOKEN`-opened PR does **not** trigger downstream workflows.
 
 **3. Add the workflow** — `.github/workflows/translate.yml`:
@@ -39,12 +39,15 @@ on:
 permissions:
   contents: write
   pull-requests: write
+  id-token: write   # identity token: proves to PTC's agent guide that this CI ran the commit
 
 jobs:
   translate:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v7
+        with:
+          fetch-depth: 2   # HEAD's parent: lets the run name the files its commit changed (agent guide)
       - uses: OnTheGoSystems/ptc-action@v1
         with:
           api-token: ${{ secrets.PTC_API_TOKEN }}
@@ -70,6 +73,17 @@ There is no GitLab component. `include: component:` is resolved by **your own** 
 ptc-translate:
   stage: deploy
   image: alpine:3.22
+  # A first translation of a large project outlives GitLab's default 1 h job limit (CI-16). 3 h covers it; the CLI stops
+  # on its own at a 45-minute bound (monitor_max_minutes in .ptc-config.yml), delivers what finished and exits 7.
+  timeout: 3h
+  # The preflight writes the CI-time limit note here (balance short of the census); the merge request description
+  # below carries it, as a GitHub pull request body does.
+  variables:
+    PTC_LIMIT_NOTE_FILE: /tmp/ptc-limit-note
+  # The job's identity token proves to PTC that this CI ran the commit (agent guide provenance).
+  id_tokens:
+    PTC_ID_TOKEN:
+      aud: ptc
   # Loop-safe twice over: the job only runs on a push to the default branch (the
   # translation push targets ptc/translations, so it cannot retrigger this job),
   # and rules: below refuses a commit marked [skip translations].
@@ -85,15 +99,34 @@ ptc-translate:
     # translations; alpine already provides it as a busybox applet, so it is
     # named here only to keep the job working if the image is ever changed.
     # git is needed by the push step below, not by the CLI.
-    - apk add --no-cache bash curl git unzip
+    - apk add --no-cache bash curl git unzip python3
   script:
     # Downloaded OUTSIDE the checkout: anything this job writes into the working
     # tree is a file the commit below could sweep into the merge request, and
     # the CLI is 100+ KB of it.
-    - curl -fsSL https://raw.githubusercontent.com/OnTheGoSystems/ptc-cli/v1.0.6/ptc-cli.sh -o /tmp/ptc-cli.sh
+    # A CI/CD variable PTC_CLI_URL pins another copy of the CLI (curl accepts
+    # file://, e.g. file://$CI_PROJECT_DIR/cli/ptc-cli.sh for the repository's own).
+    - curl -fsSL "${PTC_CLI_URL:-https://raw.githubusercontent.com/OnTheGoSystems/ptc-cli/v1.4.0/ptc-cli.sh}" -o /tmp/ptc-cli.sh
     - chmod +x /tmp/ptc-cli.sh
-    - rm -f /tmp/ptc-written
-    - /tmp/ptc-cli.sh --config-file .ptc-config.yml --written-manifest /tmp/ptc-written
+    - rm -f /tmp/ptc-written /tmp/ptc-limit-note
+    # Report the run to PTC's agent guide (scan, config digests, identity token); never fails the job.
+    - /tmp/ptc-cli.sh guide action-run --config-file .ptc-config.yml || true
+    # Check first (agent guide): PTC reports missing information for this commit; it never withholds the translation.
+    - PTC_ORG_TOKEN="${PTC_ORG_TOKEN:-$PTC_API_TOKEN}" /tmp/ptc-cli.sh guide check --json --config-file .ptc-config.yml > /tmp/ptc-check.json || true
+    # The merge request's description carries PTC's findings (set by the push below; the project setting in PTC turns
+    # them off). They are printed here too, so every job log shows them, also when there is nothing new to push.
+    - ptc_mr_description="$(/tmp/ptc-cli.sh guide mr-description --file /tmp/ptc-check.json)"
+    # Exit 5 = partial: PTC rejected some files or could not be reached for them, and
+    # every other file was written.
+    # Exit 6 = partial: some files wait in PTC (an over-limit approval, or paused
+    # out-of-credit) and every other file was written. Exit 7 = the translation is still running in PTC at the
+    # CLI's monitor bound and every finished file was written. Deliver those below,
+    # then fail the job at the end with the reason.
+    - ptc_rc=0
+    - /tmp/ptc-cli.sh --config-file .ptc-config.yml --written-manifest /tmp/ptc-written || ptc_rc=$?
+    - if [ "$ptc_rc" -ne 0 ] && [ "$ptc_rc" -ne 5 ] && [ "$ptc_rc" -ne 6 ] && [ "$ptc_rc" -ne 7 ]; then exit "$ptc_rc"; fi
+    # Exit 7: the delivery-commit report below tells PTC the run stopped while it was still translating.
+    - ptc_stopped=""; if [ "$ptc_rc" -eq 7 ]; then ptc_stopped="--stopped-reason monitor_bound"; fi
     # Pushing needs a token that may write to the repository. CI_JOB_TOKEN can,
     # but ONLY if a maintainer turns on Settings > CI/CD > Job token permissions
     # > "Allow Git push requests to the repository" (GitLab 18.4+, off by
@@ -118,11 +151,22 @@ ptc-translate:
       git add --pathspec-from-file=/tmp/ptc-written --pathspec-file-nul || true
       if ! git diff --cached --quiet; then
         git commit -m "chore(i18n): update translations via PTC [skip translations]"
+        ptc_mr_description="$(/tmp/ptc-cli.sh guide mr-description --file /tmp/ptc-check.json)"
         git push -o merge_request.create \
                  -o merge_request.target="$CI_DEFAULT_BRANCH" \
                  -o merge_request.title="Update translations from PTC" \
+                 -o merge_request.description="$ptc_mr_description" \
                  -f "https://gitlab-ci-token:${PTC_GIT_PUSH_TOKEN:-$CI_JOB_TOKEN}@${CI_SERVER_HOST}/${CI_PROJECT_PATH}.git" HEAD:ptc/translations
+        # PTC observes its delivery on the translations branch (P4 T14): the commit and its delivered files'
+        # sha256 (S2-R14: a trusted report of PTC's delivery on the translations branch is the delivery proof).
+        /tmp/ptc-cli.sh guide delivery-commit --commit "$(git rev-parse HEAD)" --branch ptc/translations --source-commit "$CI_COMMIT_SHA" --config-file .ptc-config.yml $ptc_stopped || true
+      elif [ -n "$ptc_stopped" ]; then
+        # Nothing finished inside the bound: PTC still hears that this run stopped, so the guide says "re-run the job".
+        /tmp/ptc-cli.sh guide delivery-commit $ptc_stopped --source-commit "$CI_COMMIT_SHA" --config-file .ptc-config.yml || true
       fi
+    - if [ "$ptc_rc" -eq 5 ]; then echo "PTC rejected some files or could not be reached for them (see 'Rejected by PTC' / 'Could not reach PTC' above); the rest was delivered."; exit 5; fi
+    - if [ "$ptc_rc" -eq 6 ]; then echo "Some files wait in PTC - parked for an over-limit approval, or paused out-of-credit (see the lists above); the rest was delivered. Approve in PTC or top up the credit, then re-run."; exit 6; fi
+    - if [ "$ptc_rc" -eq 7 ]; then echo "The translation is still running in PTC (see 'Still translating in PTC' above); the finished files were delivered. Retry this job once PTC finishes, or check progress / download manually with the commands printed there."; exit 7; fi
 ```
 
 Store `PTC_API_TOKEN` as a **masked** CI/CD variable (Settings → CI/CD → Variables). It is read from the environment, never placed on the command line.
@@ -133,10 +177,10 @@ On the `before_script` line: `bash` and `curl` are what a bare `alpine:3.22` lac
 
 Loop-safe twice over: the job only runs on a push to the default branch — the translation push targets `ptc/translations`, so it cannot re-trigger — and the commit carries `[skip ci]`, the only skip token GitLab honours.
 
-Pin `v1.0.5` to a different release if you want, and add a `sha256sum` check to get the same integrity guarantee the GitHub action gets from vendoring:
+Pin `v1.3.1` to a different release if you want, and add a `sha256sum` check to get the same integrity guarantee the GitHub action gets from vendoring:
 
 ```
-d5b1b2c62c530f43d76aa924e399548379369e458955a31bd11539580d71428d  ptc-cli.sh
+3894f8c6172b8228008a5450860d7bf2affebe2adfc9f0086bec167b25008e93  ptc-cli.sh
 ```
 
 <details>
@@ -152,16 +196,18 @@ d5b1b2c62c530f43d76aa924e399548379369e458955a31bd11539580d71428d  ptc-cli.sh
 
 | Input | Required | Default | Description |
 |---|---|---|---|
-| `api-token` | ✅ | — | PTC project token. Passed via the `PTC_API_TOKEN` env var, never argv. |
+| `api-token` | ✅ | — | PTC API token (organization or project token). Passed via the `PTC_API_TOKEN` env var, never argv. |
 | `config-file` | | `''` | Path to `.ptc-config.yml`. Optional: a `.ptc-config.yml` committed at the repo root is used on its own, and with no config at all the action detects the layout itself. Takes precedence over `source-locale`/`patterns`. |
 | `source-locale` | | `''` | Source language code. Only to override detection (with `patterns`). |
 | `patterns` | | `''` | Glob(s) with a `{{lang}}` slot. Only to override detection. |
 | `file-tag-name` | | auto | PTC file tag (defaults to the git branch). |
-| `api-url` | | `https://app.ptc.wpml.org/api/v1/` | Override for a self-hosted instance. |
+| `api-url` | | `https://app.ptc.wpml.org/api/v1/` | Override for a self-hosted instance. Left at the default, an `api_url` in the config file is used instead. |
 | `project-dir` | | `.` | Directory treated as project root. |
 | `create-pr` | | `false` | Open/update a PR with the translations. |
 | `pr-token` | | `''` → falls back to `github.token` | Token that opens the PR (use a PAT/App token to trigger downstream CI). |
 | `pr-branch` | | `ptc/translations` | Stable branch — re-runs update the same PR. |
+| `monitor-interval` | | `''` → 5 | Seconds between translation-status polls. |
+| `monitor-max-attempts` | | `''` → max(100, 20 x files) | Status polls before the run gives up and exits 1 listing the unfinished files. The default scales with the number of files pushed (100 polls minimum, 20 per file); a value given here is used as is. With an agent token PTC accepts 60 uploads a minute per organization (a project token: 10). |
 
 ### Outputs
 
@@ -171,6 +217,52 @@ d5b1b2c62c530f43d76aa924e399548379369e458955a31bd11539580d71428d  ptc-cli.sh
 | `pr-url` | The PR URL. |
 
 ---
+
+## Agent guide report
+
+After the configuration is resolved, the action runs `ptc scan --json` and posts
+it to PTC's `/guide/action_runs` together with the commit sha, the branch, the
+parsed `.ptc-config.yml` and the content of the source files (up to 200 KB), using
+the same token, plus `files_sha` (sha256 of the committed `.ptc-config.yml`
+files and CI workflow files), `delivered_files_sha` (sha256 of the committed
+delivered translation files, so PTC can tell a delivered file edited in git) and `ci_id_token`: the run's GitHub identity token
+(audience `ptc`), which proves to PTC that CI — not an agent — ran the commit.
+The token exists only when the workflow grants `permissions: id-token: write`
+(as in the Quick start); without it the run is reported as *unverified
+provenance* and the guide will ask for the permission. PTC uses the report to
+verify the steps of its agent guide and ignores it when the guide is off for
+the organization. The report never fails the
+run; set `guide-report: 'false'` to turn it off. It needs `python3` on the runner
+(present on GitHub-hosted runners; skipped with a notice when missing).
+
+**Guide check.** With `guide-check: 'true'` the action, BEFORE translating, asks PTC which
+information is missing for this commit (`ptc guide check`): `pass`, `fail` (new strings
+without a description, new templates not checked, setup not finished) or `error` (PTC could
+not evaluate: no guide session, no report for the commit, PTC unreachable). The check never
+withholds the translation: the translation and its pull request always happen, and PTC
+redelivers the affected strings once the information arrives. New strings with no code usage
+yet are listed as notes, never failures. With `create-pr: 'true'` the action posts ONE
+findings comment on the translation pull request (updated in place on later runs): the
+findings, the notes, the next step for an agent (`ptc guide next`) and the project's guide
+page, plus a link to the repository's settings for auto-merge. The comment needs
+`permissions: pull-requests: write`; it is on by default and switched off on the project's
+guide page in PTC. The verdict is the `guide-check` output; `guide-check-fail: 'true'` fails
+the job on anything else, in its own last step, after the pull request.
+When the translation itself fails (any exit other than 0 or 5), the check still runs,
+report-only: the Translate step keeps the translation's exit code, and the last step
+("Fail on the agent-guide check") reports both the translation failure and the check
+verdict, so a failed translation never hides the gate. The check's own exit code stays
+0 (pass), 1 (fail) or 2 (cannot evaluate).
+In a suite, the check uses `guide.session_id` of the product's `.ptc-config.yml`.
+The check never changes the guide; the report does.
+
+## Running the job locally: `ptc sync`
+
+The same steps this action runs — report the run, PTC's check, translate, report the written files — run on an agent's
+machine with `ptc sync` (the vendored `ptc-cli.sh sync`; agent token in `PTC_ORG_TOKEN`). It exits with this
+action's codes (0, 5 rejected/unreachable, 6 parked, 7 still translating) and prints the same final lines; its delivery
+report names no branch: the working tree's fingerprint and the sha256 of the files it wrote. See the CLI README
+(`ptc sync`).
 
 ## How it stays loop-safe & hands-off
 

@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Minimal stand-in for the PTC API, enough to drive ptc-cli.sh 1.0.5 end to end.
+"""Minimal stand-in for the PTC API, enough to drive ptc-cli.sh 1.1.0 end to end.
 
 Endpoints (all under /api/v1/):
     GET  languages                        -> preflight #1 (+ balance headers)
@@ -69,6 +69,9 @@ def make_zip(file_path):
     return buf.getvalue()
 
 
+LAST_ACTION_RUN = None
+
+
 class Handler(BaseHTTPRequestHandler):
     protocol_version = "HTTP/1.1"
     server_version = "mock-ptc/1"
@@ -127,6 +130,15 @@ class Handler(BaseHTTPRequestHandler):
         route, q = self._path()
         journal(f"GET  /{route}  q={ {k: v[0] for k, v in q.items()} }  auth={'yes' if self._auth() else 'no'}")
 
+        if route == "guide/action_runs/last":
+            return self._json(200 if LAST_ACTION_RUN else 404, LAST_ACTION_RUN or {})
+
+        if route == "_oidc/token":
+            # Stand-in for GitHub's ACTIONS_ID_TOKEN_REQUEST_URL: echoes the requested audience in a JWT-shaped value.
+            import base64
+            enc = lambda o: base64.urlsafe_b64encode(json.dumps(o).encode()).rstrip(b"=").decode()
+            return self._json(200, {"value": enc({"alg": "RS256"}) + "." + enc({"aud": q.get("audience", [""])[0]}) + ".sig"})
+
         if route == "languages":
             if self._need_token():
                 return
@@ -170,6 +182,13 @@ class Handler(BaseHTTPRequestHandler):
         route, q = self._path()
         body = self._body()
         journal(f"POST /{route}  {len(body)}B  auth={'yes' if self._auth() else 'no'}")
+
+        if route == "guide/action_runs":
+            # The act job reads it back through GET guide/action_runs/last.
+            global LAST_ACTION_RUN
+            LAST_ACTION_RUN = {"headers": {k: v for k, v in self.headers.items()},
+                               "body": json.loads(body or b"null")}
+            return self._json(201, {"received": True})
 
         if route == "source_files":
             if self._need_token():

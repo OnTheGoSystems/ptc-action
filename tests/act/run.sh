@@ -149,6 +149,7 @@ case "$MODE" in
     act_job push output-points-elsewhere
     act_job push nothing-written-opens-no-pull-request
     act_job push push-still-opens-a-pull-request
+    act_job push guide-action-run-is-posted
     act_job pull_request pull-request-is-refused -e "$HERE/events/pull_request.json"
     ;;
   # Anything else is taken as a job name, run on push - handy while writing a

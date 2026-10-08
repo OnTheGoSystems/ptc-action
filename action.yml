@@ -7,7 +7,7 @@ branding:
 
 inputs:
   api-token:
-    description: 'PTC project API token. Pass the secrets.PTC_API_TOKEN value. Sent to PTC via the PTC_API_TOKEN env var only — never on the command line.'
+    description: 'PTC API token: your agent token (one secret for every product of a repository) or a project token. Pass the secrets.PTC_API_TOKEN value. With permissions id-token: write the action also proves its run to the agent guide with the GitHub identity token (audience ptc). Sent to PTC via the PTC_API_TOKEN env var only — never on the command line.'
     required: true
   config-file:
     description: 'Path to .ptc-config.yml. Optional — a .ptc-config.yml committed at the repository root is picked up on its own, and with no config at all the action detects the layout itself (see below). Takes precedence over source-locale/patterns.'
@@ -30,11 +30,15 @@ inputs:
     required: false
     default: ''
   monitor-max-attempts:
-    description: 'How many times to poll before giving up. CLI default is 100, i.e. ~8 minutes at the default interval — a run that needs longer exits 1 with the unfinished files listed, so raise this for big projects.'
+    description: 'How many times to poll before giving up. Left empty, the CLI uses max(100, 20 x files pushed), i.e. at least ~8 minutes at the default interval and 100 s per file beyond five files — a run that needs longer stops with exit 7 (see monitor-max-minutes). A value given here is used as is.'
+    required: false
+    default: ''
+  monitor-max-minutes:
+    description: 'Wall-clock bound on the run, counted from the first upload (CLI default 45). Reached with files still translating, the finished translations are delivered, the CLI prints the options (re-run the job once PTC finishes, check progress, download manually) and the job fails with exit 7 ("translation still running in PTC"). Keep it below the job timeout-minutes.'
     required: false
     default: ''
   api-url:
-    description: 'PTC API base URL. Override only for a self-hosted instance.'
+    description: 'PTC API base URL. Override only for a self-hosted instance. Left at this default, an api_url in the config file is used instead.'
     required: false
     default: 'https://app.ptc.wpml.org/api/v1/'
   project-dir:
@@ -49,12 +53,27 @@ inputs:
     description: 'Token used to open the PR. Leave empty to use GITHUB_TOKEN; supply a PAT or GitHub App token so the translation PR triggers your downstream CI (GITHUB_TOKEN-opened PRs do not). Composite-action input defaults cannot evaluate github.token, so the fallback happens in the step.'
     required: false
     default: ''
+  guide-report:
+    description: 'If "true" (default), report this run (scan, parsed config, commit, source-file sample) to PTC for its agent guide. Never fails the run.'
+    required: false
+    default: 'true'
+  guide-check:
+    description: 'If "true", after reporting the run and BEFORE translating, ask PTC which information is missing for this commit (`ptc guide check`; it never withholds the translation) and expose the verdict as the guide-check output (pass / fail / error). With create-pr, PTC''s findings are posted as ONE comment on the translation pull request (needs permissions: pull-requests: write; switched off per project in PTC). Set guide-check-fail to "true" to fail the job on fail / error.'
+    required: false
+    default: 'false'
+  guide-check-fail:
+    description: 'If "true", a guide-check verdict other than pass fails the job (exit 1 on fail, 2 when PTC cannot evaluate). The job fails in its own last step, AFTER the translation and its pull request: missing information never withholds a delivery (the check finds missing information only; delivered translations are PTC''s own bookkeeping).'
+    required: false
+    default: 'false'
   pr-branch:
     description: 'Stable branch the translation PR is pushed to. Re-runs update the SAME PR instead of spawning new ones (loop-safe).'
     required: false
     default: 'ptc/translations'
 
 outputs:
+  guide-check:
+    description: 'The agent-guide gate verdict for this commit when guide-check=true: pass, fail, or error (PTC could not evaluate).'
+    value: ${{ steps.ptc.outputs.guide-check }}
   pr-number:
     description: 'The pull request number, when create-pr=true and there were changes.'
     value: ${{ steps.cpr.outputs.pull-request-number }}
@@ -142,8 +161,12 @@ runs:
         INPUT_FILE_TAG_NAME: ${{ inputs.file-tag-name }}
         INPUT_MONITOR_INTERVAL: ${{ inputs.monitor-interval }}
         INPUT_MONITOR_MAX_ATTEMPTS: ${{ inputs.monitor-max-attempts }}
+        INPUT_MONITOR_MAX_MINUTES: ${{ inputs.monitor-max-minutes }}
         ACTION_PATH: ${{ github.action_path }}
         INPUT_CREATE_PR: ${{ inputs.create-pr }}
+        INPUT_GUIDE_REPORT: ${{ inputs.guide-report }}
+        INPUT_GUIDE_CHECK: ${{ inputs.guide-check }}
+        INPUT_GUIDE_CHECK_FAIL: ${{ inputs.guide-check-fail }}
       run: |
         set -euo pipefail
         echo "::add-mask::${PTC_API_TOKEN}"
@@ -206,6 +229,47 @@ runs:
           sed 's/^/  /' .ptc-config.yml
         fi
 
+        # AGD-11: a config's api_url wins over the api-url input's default (never over an explicit input).
+        . "$ACTION_PATH/lib/api-url.sh"
+        INPUT_API_URL="$(ptc_effective_api_url "$INPUT_API_URL" "$CONFIG")"
+
+        # Agent guide: tell PTC what this run saw (scan + parsed config +
+        # commit). PTC verifies the guide's steps against it - tier-1 proof -
+        # and ignores it when the guide is off. It must never cost the caller
+        # a translation, so every failure here is a notice, not an error.
+        if [ "${INPUT_GUIDE_REPORT:-true}" = "true" ]; then
+          guide_args=( guide action-run --api-url "$INPUT_API_URL" )
+          [ -n "$CONFIG" ] && guide_args+=( --config-file "$CONFIG" )
+          "$CLI" "${guide_args[@]}" || echo "PTC guide report skipped (the run continues)."
+        fi
+        # P4 (R2, check-first): the agent-guide check runs BEFORE the translation and only reports missing information;
+        # it never withholds the translation (R1). Its JSON feeds the findings comment on the translation pull request.
+        if [ "${INPUT_GUIDE_CHECK:-false}" = "true" ]; then
+          check_rc=0
+          CHECK_JSON="$(mktemp "${RUNNER_TEMP:-/tmp}/ptc-guide-check.XXXXXX")"
+          check_args=( guide check --json --api-url "$INPUT_API_URL" )
+          [ -n "$CONFIG" ] && check_args+=( --config-file "$CONFIG" )
+          PTC_ORG_TOKEN="${PTC_ORG_TOKEN:-$PTC_API_TOKEN}" "$CLI" "${check_args[@]}" > "$CHECK_JSON" || check_rc=$?
+          python3 - "$CHECK_JSON" <<'PY_CHECK' || true
+        import json, sys
+        try:
+            d = json.load(open(sys.argv[1]))
+        except Exception:
+            print("PTC agent-guide check: no readable answer"); sys.exit(0)
+        if d.get("verdict") == "error":
+            e = d.get("error") or {}
+            print("PTC agent-guide check cannot evaluate (%s): %s" % (e.get("code"), e.get("message"))); sys.exit(0)
+        print("PTC agent-guide check: %s (%s reasons, %s notes)" % (d.get("verdict"), d.get("reasons_total", 0), d.get("notes_total", 0)))
+        for r in d.get("reasons") or []:
+            print("  [%s] %s" % (r.get("code"), r.get("message")))
+        for n in d.get("notes") or []:
+            print("  note: %s" % n.get("message"))
+        PY_CHECK
+          case "$check_rc" in 0) verdict=pass ;; 1) verdict=fail ;; *) verdict=error ;; esac
+          echo "guide-check=$verdict" >> "$GITHUB_OUTPUT"
+          echo "guide-check-rc=$check_rc" >> "$GITHUB_OUTPUT"
+          echo "guide-check-json=$CHECK_JSON" >> "$GITHUB_OUTPUT"
+        fi
         args=( --api-url "$INPUT_API_URL" )
         [ -n "$CONFIG" ]        && args+=( --config-file "$CONFIG" )
         [ -n "$SOURCE_LOCALE" ] && [ -z "$CONFIG" ] && args+=( --source-locale "$SOURCE_LOCALE" )
@@ -213,7 +277,28 @@ runs:
         [ -n "$INPUT_FILE_TAG_NAME" ] && args+=( --file-tag-name "$INPUT_FILE_TAG_NAME" )
         [ -n "$INPUT_MONITOR_INTERVAL" ]     && args+=( --monitor-interval "$INPUT_MONITOR_INTERVAL" )
         [ -n "$INPUT_MONITOR_MAX_ATTEMPTS" ] && args+=( --monitor-max-attempts "$INPUT_MONITOR_MAX_ATTEMPTS" )
-        "$CLI" "${args[@]}"
+        [ -n "$INPUT_MONITOR_MAX_MINUTES" ]  && args+=( --monitor-max-minutes "$INPUT_MONITOR_MAX_MINUTES" )
+        # Exit 5 = partial (E20): PTC rejected some files (e.g. a processing 422) or could not be reached for them
+        # (S2-R12, S2-R19), and every other file completed
+        # and was written. Those translations are still delivered below; the last step then fails the job and
+        # names the rejected files. Exit 6 = partial too (S2-R15, CI-16): some files wait for an over-limit approval in
+        # PTC; every other file is delivered the same way and the last step fails the job with the approval as the
+        # reason. Exit 7 (S2-R3B F-2, CI-16): the translation is still running in PTC at the CLI's monitor bound; every
+        # finished file is delivered the same way, the report step tells PTC the run stopped, and the last step fails
+        # the job with the options. Any other failure stops here, as before.
+        cli_rc=0
+        "$CLI" "${args[@]}" || cli_rc=$?
+        echo "cli-exit=$cli_rc" >> "$GITHUB_OUTPUT"
+
+        # G8 gate: PTC's verdict for this commit's run (never opens tasks). Exit 0 pass / 1 fail / 2 cannot evaluate.
+        # Order (P3-FIX6, P4 R1): AFTER the translation, and it never stops this step: missing information never withholds
+        # a delivery, so a gate that exited before the translation and its pull request would block the delivery. With
+        # guide-check-fail the job fails in the "Fail on the agent-guide check" step, after the pull request is opened.
+        # P3-FIX7 (AGD-12, POL-40): it also runs when the translation failed, report-only: this step still exits with
+        # the translation's exit code, and the "Fail on the agent-guide check" step reports both.
+        if [ "$cli_rc" -ne 0 ] && [ "$cli_rc" -ne 5 ] && [ "$cli_rc" -ne 6 ] && [ "$cli_rc" -ne 7 ]; then
+          exit "$cli_rc"
+        fi
 
         # The pull request must carry translation output and nothing else.
         # Committing the whole workspace sweeps in anything the caller's job
@@ -301,5 +386,182 @@ runs:
 
           - Source: `${{ github.sha }}`
           - Re-runs update this same PR.
+
+          ${{ steps.ptc.outputs.limit-note }}
         delete-branch: true
         add-paths: ${{ steps.ptc.outputs.add-paths }}
+
+    - name: Report the translations-branch commit to PTC
+      id: report
+      # P4 T14 (R3): PTC counts its delivery once it is OBSERVED on the translations branch: the commit this pull request
+      # step made and the sha256 of the delivered files in it. P4-H / S2-R14 (Eran 2026-10-02): a trusted report of PTC's
+      # delivery on the translations branch is the delivery proof (PTC closes it; no `ptc validate`, PTC validates what it
+      # generates). PTC answers the source commit's check recomputed, which the findings comment and the fail step below
+      # read. Best-effort: never fails the job.
+      # S2-R3B F-2 (CI-16): it also runs when the translation stopped at the CLI's monitor bound (exit 7) and nothing was
+      # committed, so PTC hears that the run stopped and the guide says "re-run the job" instead of waiting.
+      if: ${{ !cancelled() && inputs.guide-report == 'true' && (steps.cpr.outputs.pull-request-head-sha != '' || steps.ptc.outputs.cli-exit == '7') }}
+      shell: bash
+      working-directory: ${{ inputs.project-dir }}
+      env:
+        PTC_API_TOKEN: ${{ inputs.api-token }}
+        ACTION_PATH: ${{ github.action_path }}
+        INPUT_API_URL: ${{ inputs.api-url }}
+        INPUT_CONFIG_FILE: ${{ inputs.config-file }}
+        HEAD_SHA: ${{ steps.cpr.outputs.pull-request-head-sha }}
+        PR_BRANCH: ${{ inputs.pr-branch }}
+        CLI_EXIT: ${{ steps.ptc.outputs.cli-exit }}
+      run: |
+        set -uo pipefail
+        echo "::add-mask::${PTC_API_TOKEN}"
+        OUT="$(mktemp "${RUNNER_TEMP:-/tmp}/ptc-delivery.XXXXXX")"
+        args=( guide delivery-commit --source-commit "$GITHUB_SHA" --out "$OUT" )
+        if [ -n "${HEAD_SHA:-}" ]; then
+          # create-pull-request pushed HEAD_SHA; make sure the commit object is here before reading its files.
+          git cat-file -e "${HEAD_SHA}^{commit}" 2>/dev/null || git fetch --no-tags --depth=1 origin "$HEAD_SHA" 2>/dev/null || true
+          args+=( --commit "$HEAD_SHA" --branch "$PR_BRANCH" )
+        fi
+        # The run stopped at its monitor bound while PTC was still translating: reported with the commit, or alone.
+        [ "${CLI_EXIT:-}" = "7" ] && args+=( --stopped-reason monitor_bound )
+        CONFIG="$INPUT_CONFIG_FILE"
+        [ -z "$CONFIG" ] && [ -f .ptc-config.yml ] && CONFIG=.ptc-config.yml
+        [ -n "$CONFIG" ] && args+=( --config-file "$CONFIG" )
+        # AGD-11: a config's api_url wins over the api-url input's default (never over an explicit input).
+        . "$ACTION_PATH/lib/api-url.sh"
+        args+=( --api-url "$(ptc_effective_api_url "$INPUT_API_URL" "$CONFIG")" )
+        "$ACTION_PATH/ptc-cli.sh" "${args[@]}" || echo "PTC translations-branch report skipped (the run continues)."
+        # The recomputed check (with the delivery's verdict) replaces the pre-translation one for the comment and the fail step.
+        CHECK_FILE="${OUT}.check.json"
+        VERDICT="$(python3 - "$OUT" "$CHECK_FILE" <<'PY_REPORT'
+        import json, sys
+        try:
+            check = json.load(open(sys.argv[1])).get("check")
+        except Exception:
+            check = None
+        if isinstance(check, dict) and check.get("verdict"):
+            json.dump(check, open(sys.argv[2], "w"))
+            print(check["verdict"])
+        PY_REPORT
+        )" || VERDICT=""
+        if [ -n "$VERDICT" ]; then
+          echo "guide-check=$VERDICT" >> "$GITHUB_OUTPUT"
+          echo "guide-check-json=$CHECK_FILE" >> "$GITHUB_OUTPUT"
+        fi
+
+    - name: Comment the agent-guide findings on the translation pull request
+      if: ${{ !cancelled() && inputs.guide-check == 'true' && steps.cpr.outputs.pull-request-number != '' && (steps.report.outputs.guide-check-json || steps.ptc.outputs.guide-check-json) != '' }}
+      shell: bash
+      env:
+        GH_TOKEN: ${{ inputs.pr-token != '' && inputs.pr-token || github.token }}
+        PR_NUMBER: ${{ steps.cpr.outputs.pull-request-number }}
+        CHECK_JSON: ${{ steps.report.outputs.guide-check-json || steps.ptc.outputs.guide-check-json }}
+        PR_BRANCH: ${{ inputs.pr-branch }}
+      run: |
+        # P4 (R4, T5): ONE findings comment per translation pull request (found by PTC's marker and updated in place). PTC
+        # composes it (findings, carried-string notes, next action, the project's guide page); the project setting in PTC
+        # turns it off. Never fails the job.
+        set -uo pipefail
+        BODY="$(mktemp "${RUNNER_TEMP:-/tmp}/ptc-guide-comment.XXXXXX")"
+        MARKER="$(python3 - "$CHECK_JSON" "$BODY" "$PR_BRANCH" <<'PY_COMMENT'
+        import json, sys
+        src, out, branch = sys.argv[1:4]
+        try:
+            d = json.load(open(src))
+        except Exception:
+            sys.exit(0)
+        c = d.get("comment") or {}
+        if not c.get("enabled") or not c.get("body"):
+            sys.exit(0)
+        post = bool(d.get("reasons") or d.get("notes"))
+        # T17: the links are GitHub's own documentation pages, fetched and checked 2026-09-28 (anchors seen on the page).
+        body = c["body"] + ("\n\nAuto-merge: a repository admin allows it under Settings > General > \"Pull Requests\" > \"Allow auto-merge\" "
+                            "(" + "https://docs.github.com/en/repositories/configuring-branches-and-merges-in-your-repository/configuring-pull-request-merges/managing-auto-merge-for-pull-requests-in-your-repository#managing-auto-merge" + "); then anyone with write access selects \"Enable auto-merge\" on this "
+                            "pull request (" + "https://docs.github.com/en/pull-requests/how-tos/merge-and-close-pull-requests/automatically-merging-a-pull-request#enabling-auto-merge" + ")."
+                            "\nFetch the translations branch: `git fetch origin " + branch + "`")
+        open(out, "w").write(json.dumps({"body": body}))
+        print(c.get("marker", "") + ("|post" if post else "|update"))
+        PY_COMMENT
+        )"
+        if [ -z "$MARKER" ]; then
+          echo "PTC agent-guide findings comment: off for this project (PTC project setting) or no check answer"
+          exit 0
+        fi
+        MODE="${MARKER##*|}"; MARKER="${MARKER%|*}"
+        # S2-R3B C-5: PTC's marker is data, never spliced into a jq program (gh api has no --arg): the pages are parsed here.
+        EXISTING="$(gh api "repos/${GITHUB_REPOSITORY}/issues/${PR_NUMBER}/comments" --paginate 2>/dev/null | MARKER="$MARKER" python3 -c '
+        import json, os, sys
+        marker, raw, dec, pos = os.environ["MARKER"], sys.stdin.read(), json.JSONDecoder(), 0
+        while pos < len(raw):
+            while pos < len(raw) and raw[pos].isspace(): pos += 1
+            if pos >= len(raw): break
+            page, pos = dec.raw_decode(raw, pos)
+            for c in page if isinstance(page, list) else []:
+                if marker in (c.get("body") or ""):
+                    print(c["id"]); sys.exit(0)
+        ' 2>/dev/null || true)"
+        if [ -n "$EXISTING" ]; then
+          gh api -X PATCH "repos/${GITHUB_REPOSITORY}/issues/comments/${EXISTING}" --input "$BODY" > /dev/null \
+            && echo "PTC agent-guide findings comment updated on #${PR_NUMBER}" || echo "::warning::could not update the PTC findings comment (needs pull-requests: write)"
+        elif [ "$MODE" = "post" ]; then
+          gh api -X POST "repos/${GITHUB_REPOSITORY}/issues/${PR_NUMBER}/comments" --input "$BODY" > /dev/null \
+            && echo "PTC agent-guide findings comment posted on #${PR_NUMBER}" || echo "::warning::could not post the PTC findings comment (needs pull-requests: write)"
+        else
+          echo "PTC agent-guide check: nothing to report on #${PR_NUMBER}"
+        fi
+        rm -f "$BODY"
+
+    - name: Fail on the agent-guide check
+      # After the translation and its pull request (P3-FIX6): the gate reports, it never withholds the translation.
+      # P3-FIX7 (POL-40): when the Translate step failed, this step reports that failure AND the check verdict (the check
+      # ran report-only), so a failed translation never hides the gate. The check's own exit code stays 0 / 1 / 2.
+      if: ${{ !cancelled() && inputs.guide-check == 'true' && (steps.ptc.outcome == 'failure' || (inputs.guide-check-fail == 'true' && (steps.report.outputs.guide-check || steps.ptc.outputs.guide-check) != 'pass')) }}
+      shell: bash
+      env:
+        VERDICT: ${{ steps.report.outputs.guide-check || steps.ptc.outputs.guide-check }}
+        CHECK_RC: ${{ steps.ptc.outputs.guide-check-rc }}
+        CLI_EXIT: ${{ steps.ptc.outputs.cli-exit }}
+        TRANSLATE: ${{ steps.ptc.outcome }}
+        FAIL_ON_CHECK: ${{ inputs.guide-check-fail }}
+      run: |
+        if [ "$TRANSLATE" = "failure" ]; then
+          echo "::error::PTC translate step failed (exit ${CLI_EXIT:-before the translate call}); this run delivered no translation"
+        fi
+        if [ -z "$VERDICT" ]; then
+          echo "::error::PTC agent-guide check: not run (the Translate step stopped before it)"
+        elif [ "$VERDICT" = "pass" ]; then
+          echo "::notice::PTC agent-guide check: pass (rc ${CHECK_RC})"
+        else
+          echo "::error::PTC agent-guide check: ${VERDICT} (rc ${CHECK_RC:-2}; see 'guide check' in the Translate step)"
+        fi
+        if [ "$FAIL_ON_CHECK" = "true" ] && [ "$VERDICT" != "pass" ]; then
+          exit "${CHECK_RC:-2}"
+        fi
+        if [ "$TRANSLATE" = "failure" ]; then
+          exit "${CLI_EXIT:-1}"
+        fi
+
+    - name: Fail on files PTC rejected
+      # After the pull request, so the completed translations are delivered either way (E20).
+      if: ${{ steps.ptc.outputs.cli-exit == '5' }}
+      shell: bash
+      run: |
+        echo "::error::PTC rejected some source files or could not be reached for them (listed under 'Rejected by PTC' / 'Could not reach PTC' in the Translate step); the other translations were delivered."
+        exit 5
+
+    - name: Fail on files parked for an over-limit approval
+      # S2-R15 (CI-16): after the pull request and the delivery-commit report, so every file that was not parked is
+      # delivered; the job then fails with the reason and the remedy. The next run picks the parked files up.
+      if: ${{ steps.ptc.outputs.cli-exit == '6' }}
+      shell: bash
+      run: |
+        echo "::error::Some files wait in PTC - parked for an over-limit approval, or paused out-of-credit (listed under 'Parked for an over-limit approval' / 'Paused out-of-credit in PTC' in the Translate step); the other translations were delivered. Approve the request in PTC (emailed to the organization's administrators), raise the translation approval limit, or top up the credit, then re-run."
+        exit 6
+
+    - name: Fail on files still translating in PTC
+      # S2-R3B F-2 (CI-16; Eran 2026-10-04 "explicit options"): after the pull request and the delivery-commit report (which
+      # tells PTC the run stopped), so every finished file is delivered; the job then fails with the reason and the options.
+      if: ${{ steps.ptc.outputs.cli-exit == '7' }}
+      shell: bash
+      run: |
+        echo "::error::The translation is still running in PTC: the run reached its monitor bound (the files are listed under 'Still translating in PTC' in the Translate step); the finished translations were delivered. Re-run this job once PTC finishes, or check progress / download manually with the commands printed there."
+        exit 7

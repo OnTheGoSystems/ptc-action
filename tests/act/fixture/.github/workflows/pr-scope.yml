@@ -193,6 +193,39 @@ jobs:
           echo "OK: the pull request step was skipped"
 
   # The gate must refuse the merge ref without refusing the supported path.
+  guide-action-run-is-posted:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: translate
+        uses: ./ptc-action
+        with:
+          api-token: ${{ secrets.PTC_API_TOKEN }}
+          api-url: ${{ vars.PTC_API_URL }}
+
+      - name: the run was reported to the guide with the documented body
+        env:
+          API_URL: ${{ vars.PTC_API_URL }}
+          SHA: ${{ github.sha }}
+          REF_NAME: ${{ github.ref_name }}
+        run: |
+          set -euo pipefail
+          curl -fsS "${API_URL%/}/guide/action_runs/last" -o "$RUNNER_TEMP/run.json"
+          python3 - "$RUNNER_TEMP/run.json" <<'PY'
+          import json, os, re, sys
+          d = json.load(open(sys.argv[1]))
+          b, h = d["body"], d["headers"]
+          assert sorted(b) == ["branch", "commit_sha", "config", "files_sample", "project_id", "scan"], sorted(b)
+          assert b["commit_sha"] == os.environ["SHA"], b["commit_sha"]
+          assert b["branch"] == os.environ["REF_NAME"], b["branch"]
+          assert b["scan"]["schema"] == 1 and re.match(r"^[0-9a-f]{40}$", b["scan"]["repo"]["head_sha"])
+          assert "locales/en.json" in b["files_sample"], sorted(b["files_sample"])
+          assert h["Authorization"] == "Bearer mock-token-abcdef"
+          assert re.match(r"^\d+\.\d+\.\d+$", h["X-PTC-CLI-Version"])
+          print("OK: action run posted", sorted(b["files_sample"]))
+          PY
+
   push-still-opens-a-pull-request:
     runs-on: ubuntu-latest
     steps:
