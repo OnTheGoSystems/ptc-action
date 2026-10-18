@@ -108,7 +108,7 @@ ptc-translate:
     # the CLI is 100+ KB of it.
     # A CI/CD variable PTC_CLI_URL pins another copy of the CLI (curl accepts
     # file://, e.g. file://$CI_PROJECT_DIR/cli/ptc-cli.sh for the repository's own).
-    - curl -fsSL "${PTC_CLI_URL:-https://raw.githubusercontent.com/OnTheGoSystems/ptc-cli/v1.5.1/ptc-cli.sh}" -o /tmp/ptc-cli.sh
+    - curl -fsSL "${PTC_CLI_URL:-https://raw.githubusercontent.com/OnTheGoSystems/ptc-cli/v1.5.2/ptc-cli.sh}" -o /tmp/ptc-cli.sh
     - chmod +x /tmp/ptc-cli.sh
     - rm -f /tmp/ptc-written /tmp/ptc-limit-note
     # Report the run to PTC's agent guide (scan, config digests, identity token); never fails the job.
