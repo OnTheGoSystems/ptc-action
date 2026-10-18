@@ -249,7 +249,11 @@ runs:
           CHECK_JSON="$(mktemp "${RUNNER_TEMP:-/tmp}/ptc-guide-check.XXXXXX")"
           check_args=( guide check --json --api-url "$INPUT_API_URL" )
           [ -n "$CONFIG" ] && check_args+=( --config-file "$CONFIG" )
-          PTC_ORG_TOKEN="${PTC_ORG_TOKEN:-$PTC_API_TOKEN}" "$CLI" "${check_args[@]}" > "$CHECK_JSON" || check_rc=$?
+          # L16 (SF-49): PTC_API_TOKEN, the variable PTC asks for, comes first; the legacy PTC_ORG_TOKEN only without it.
+          if [ -z "${PTC_API_TOKEN:-}" ] && [ -n "${PTC_ORG_TOKEN:-}" ]; then
+            echo "PTC_ORG_TOKEN is deprecated - set the secret PTC_API_TOKEN (your agent token) instead."
+          fi
+          PTC_ORG_TOKEN="${PTC_API_TOKEN:-$PTC_ORG_TOKEN}" "$CLI" "${check_args[@]}" > "$CHECK_JSON" || check_rc=$?
           python3 - "$CHECK_JSON" <<'PY_CHECK' || true
         import json, sys
         try:

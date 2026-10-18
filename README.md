@@ -73,8 +73,10 @@ There is no GitLab component. `include: component:` is resolved by **your own** 
 ptc-translate:
   stage: deploy
   image: alpine:3.22
-  # A first translation of a large project outlives GitLab's default 1 h job limit (CI-16). 3 h covers it; the CLI stops
-  # on its own at a 45-minute bound (monitor_max_minutes in .ptc-config.yml), delivers what finished and exits 7.
+  # A first translation of a large project outlives GitLab's default 1 h job limit (CI-16), so the job asks for 3 h; the
+  # project's timeout and the runner's maximum can still shorten it. The CLI reads the job's real limit (CI_JOB_TIMEOUT)
+  # and stops 10 minutes before it, or at its own 45-minute bound (monitor_max_minutes in .ptc-config.yml), delivers
+  # what finished and exits 7. PTC keeps translating; the next run delivers the rest and translates nothing again.
   timeout: 3h
   # The preflight writes the CI-time limit note here (balance short of the census); the merge request description
   # below carries it, as a GitHub pull request body does.
@@ -106,7 +108,7 @@ ptc-translate:
     # the CLI is 100+ KB of it.
     # A CI/CD variable PTC_CLI_URL pins another copy of the CLI (curl accepts
     # file://, e.g. file://$CI_PROJECT_DIR/cli/ptc-cli.sh for the repository's own).
-    - curl -fsSL "${PTC_CLI_URL:-https://raw.githubusercontent.com/OnTheGoSystems/ptc-cli/v1.4.0/ptc-cli.sh}" -o /tmp/ptc-cli.sh
+    - curl -fsSL "${PTC_CLI_URL:-https://raw.githubusercontent.com/OnTheGoSystems/ptc-cli/v1.5.1/ptc-cli.sh}" -o /tmp/ptc-cli.sh
     - chmod +x /tmp/ptc-cli.sh
     - rm -f /tmp/ptc-written /tmp/ptc-limit-note
     # Report the run to PTC's agent guide (scan, config digests, identity token); never fails the job.
