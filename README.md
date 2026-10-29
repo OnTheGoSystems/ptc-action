@@ -106,15 +106,18 @@ ptc-translate:
     # Downloaded OUTSIDE the checkout: anything this job writes into the working
     # tree is a file the commit below could sweep into the merge request, and
     # the CLI is 100+ KB of it.
+    # Fetched through PTC's CLI door, which counts the download and redirects to the release tag.
     # A CI/CD variable PTC_CLI_URL pins another copy of the CLI (curl accepts
     # file://, e.g. file://$CI_PROJECT_DIR/cli/ptc-cli.sh for the repository's own).
-    - curl -fsSL "${PTC_CLI_URL:-https://raw.githubusercontent.com/OnTheGoSystems/ptc-cli/v1.5.2/ptc-cli.sh}" -o /tmp/ptc-cli.sh
+    - curl -fsSL "${PTC_CLI_URL:-https://app.ptc.wpml.org/cli/v1.5.6/ptc-cli.sh}" -o /tmp/ptc-cli.sh
     - chmod +x /tmp/ptc-cli.sh
     - rm -f /tmp/ptc-written /tmp/ptc-limit-note
     # Report the run to PTC's agent guide (scan, config digests, identity token); never fails the job.
     - /tmp/ptc-cli.sh guide action-run --config-file .ptc-config.yml || true
     # Check first (agent guide): PTC reports missing information for this commit; it never withholds the translation.
-    - PTC_ORG_TOKEN="${PTC_ORG_TOKEN:-$PTC_API_TOKEN}" /tmp/ptc-cli.sh guide check --json --config-file .ptc-config.yml > /tmp/ptc-check.json || true
+    # PTC_API_TOKEN (the agent token PTC asks for) comes first; the legacy PTC_ORG_TOKEN is read only without it.
+    - if [ -z "${PTC_API_TOKEN:-}" ] && [ -n "${PTC_ORG_TOKEN:-}" ]; then echo "PTC_ORG_TOKEN is deprecated - set the masked CI/CD variable PTC_API_TOKEN (your agent token) instead."; fi
+    - PTC_ORG_TOKEN="${PTC_API_TOKEN:-$PTC_ORG_TOKEN}" /tmp/ptc-cli.sh guide check --json --config-file .ptc-config.yml > /tmp/ptc-check.json || true
     # The merge request's description carries PTC's findings (set by the push below; the project setting in PTC turns
     # them off). They are printed here too, so every job log shows them, also when there is nothing new to push.
     - ptc_mr_description="$(/tmp/ptc-cli.sh guide mr-description --file /tmp/ptc-check.json)"
@@ -138,7 +141,7 @@ ptc-translate:
     # nothing else - not this job's downloads, not whatever an earlier step in
     # your pipeline left in the working directory.
     #
-    # `|| true` is not cosmetic: if a translation lands on a path your
+    # Exit 1 from git add is tolerated, not cosmetic: if a translation lands on a path your
     # .gitignore covers, git exits 1 while still staging everything else, and
     # GitLab would abort the job on that exit code alone.
     #
@@ -146,11 +149,32 @@ ptc-translate:
     # first run the translations are new files, and a plain `git diff` only
     # looks at tracked ones - it would report "nothing changed", skip the push,
     # and leave a green job that produced no merge request.
+    #
+    # The manifest's paths are relative to the repository root, and a job may run
+    # from a subdirectory (a suite job starts with `cd <product dir>`), so the
+    # staging runs at the root. A file the run wrote that is still unstaged after
+    # it means git matched none of the paths: the job says so and fails, never a
+    # green job without a merge request.
     - |
       git config user.email "ci@ptc"
       git config user.name "PTC Translate"
       git checkout -B ptc/translations
-      git add --pathspec-from-file=/tmp/ptc-written --pathspec-file-nul || true
+      ptc_top="$(git rev-parse --show-toplevel)"
+      ptc_add_rc=0
+      git -C "$ptc_top" add --pathspec-from-file=/tmp/ptc-written --pathspec-file-nul || ptc_add_rc=$?
+      # 1 = some path is ignored (the rest is staged); 128 = a path matched nothing and git staged NOTHING.
+      if [ "$ptc_add_rc" -gt 1 ]; then
+        echo "git add of the translations this run wrote failed (exit $ptc_add_rc), so nothing was staged for the merge request."
+        exit 1
+      fi
+      if [ -s /tmp/ptc-written ]; then
+        ptc_unstaged="$(xargs -0 git -C "$ptc_top" status --porcelain --untracked-files=all -- < /tmp/ptc-written | grep '^.[^ ]' || true)"
+        if [ -n "$ptc_unstaged" ]; then
+          echo "PTC wrote these translations, but they were not staged for the merge request (git add matched none of them):"
+          echo "$ptc_unstaged"
+          exit 1
+        fi
+      fi
       if ! git diff --cached --quiet; then
         git commit -m "chore(i18n): update translations via PTC [skip translations]"
         ptc_mr_description="$(/tmp/ptc-cli.sh guide mr-description --file /tmp/ptc-check.json)"
@@ -209,7 +233,8 @@ Pin `v1.3.1` to a different release if you want, and add a `sha256sum` check to 
 | `pr-token` | | `''` → falls back to `github.token` | Token that opens the PR (use a PAT/App token to trigger downstream CI). |
 | `pr-branch` | | `ptc/translations` | Stable branch — re-runs update the same PR. |
 | `monitor-interval` | | `''` → 5 | Seconds between translation-status polls. |
-| `monitor-max-attempts` | | `''` → max(100, 20 x files) | Status polls before the run gives up and exits 1 listing the unfinished files. The default scales with the number of files pushed (100 polls minimum, 20 per file); a value given here is used as is. With an agent token PTC accepts 60 uploads a minute per organization (a project token: 10). |
+| `monitor-max-minutes` | | `''` → sized from the estimate | Wall-clock bound from the first upload. Left empty (and no `monitor_max_minutes` in the config), the estimate of the configured census at about 250 words a minute plus 15 minutes, never below 45, at most 170 (the GitLab job's sizing), under `timeout-minutes: 180`. Reached with files still translating, the job delivers what finished and fails with exit 7. |
+| `monitor-max-attempts` | | `''` → max(100, 20 x files) | Status polls before the run gives up and exits 1 listing the unfinished files. The default scales with the number of files pushed (100 polls minimum, 20 per file); a value given here is used as is. With an agent token PTC accepts 600 uploads a minute per organization (a project token: 10). |
 
 ### Outputs
 
@@ -261,7 +286,7 @@ The check never changes the guide; the report does.
 ## Running the job locally: `ptc sync`
 
 The same steps this action runs — report the run, PTC's check, translate, report the written files — run on an agent's
-machine with `ptc sync` (the vendored `ptc-cli.sh sync`; agent token in `PTC_ORG_TOKEN`). It exits with this
+machine with `ptc sync` (the vendored `ptc-cli.sh sync`; agent token in `PTC_API_TOKEN`, `PTC_ORG_TOKEN` still accepted). It exits with this
 action's codes (0, 5 rejected/unreachable, 6 parked, 7 still translating) and prints the same final lines; its delivery
 report names no branch: the working tree's fingerprint and the sha256 of the files it wrote. See the CLI README
 (`ptc sync`).
@@ -270,6 +295,7 @@ report names no branch: the working tree's fingerprint and the sha256 of the fil
 
 - **Trigger on source paths only** (`paths:` / default-branch rule) — a translation-only commit can never re-trigger the run. This is what actually breaks the loop.
 - **Stable `ptc/translations` branch** — re-runs update ONE PR instead of spawning new ones, and a PR branch is not a trigger branch.
+- **Exit 7 is one click** — when the run stops at its bound while PTC is still translating, click "Re-run failed jobs" (GitLab: "Retry this job") once PTC finishes. The re-run keeps the run id, so PTC translates nothing again; it keeps every file the first job delivered (downloaded again into the fresh checkout) and adds the rest, so the PR grows run by run.
 - **PR token is explicit** so the translation PR actually runs your repo's own checks.
 
 > The translation commit carries a `[skip translations]` marker. It is a human-readable label, **not** a CI skip token — GitHub honours only `[skip ci]`, `[ci skip]`, `[no ci]`, `[skip actions]` and `[actions skip]`. Do not rely on it as a guard; rely on the two above.

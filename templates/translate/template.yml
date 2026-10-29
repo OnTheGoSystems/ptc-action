@@ -39,7 +39,7 @@ spec:
       description: 'How many polls before giving up. CLI default is 100 (~8 min at the default interval); a run that needs longer exits 1 with the unfinished files listed.'
       default: ''
     cli-ref:
-      description: 'ptc-cli git ref to fetch. Defaults to the immutable commit behind v1.0.6 — a tag can be moved, a commit cannot.'
+      description: 'ptc-cli ref to fetch through PTC''s CLI door (it counts the download and redirects to GitHub): a release tag (v1.5.2, v1) or a 40-hex commit. Defaults to the immutable commit behind v1.0.6 — a tag can be moved, a commit cannot.'
       default: 'dfc667224787c8d6064257da2e5dd980ac28c108'
     cli-sha256:
       description: 'Expected sha256 of ptc-cli.sh. Verified after download; set to an empty string to skip (only if you also override cli-ref).'
@@ -58,7 +58,7 @@ spec:
   rules:
     - if: '$CI_PIPELINE_SOURCE == "push" && $CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH && $CI_COMMIT_MESSAGE !~ /\[skip translations\]/'
   variables:
-    PTC_CLI_URL: "https://raw.githubusercontent.com/OnTheGoSystems/ptc-cli/$[[ inputs.cli-ref ]]/ptc-cli.sh"
+    PTC_CLI_URL: "https://app.ptc.wpml.org/cli/$[[ inputs.cli-ref ]]/ptc-cli.sh"
   before_script:
     - apk add --no-cache bash curl git unzip
   script:

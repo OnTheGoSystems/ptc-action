@@ -34,7 +34,7 @@ inputs:
     required: false
     default: ''
   monitor-max-minutes:
-    description: 'Wall-clock bound on the run, counted from the first upload (CLI default 45). Reached with files still translating, the finished translations are delivered, the CLI prints the options (re-run the job once PTC finishes, check progress, download manually) and the job fails with exit 7 ("translation still running in PTC"). Keep it below the job timeout-minutes.'
+    description: 'Wall-clock bound on the run, counted from the first upload. Left empty (and no monitor_max_minutes in the config), it is sized from the estimate of the configured census as the GitLab job is: about 250 words a minute plus 15 minutes, never below the CLI default 45, at most 170. Reached with files still translating, the finished translations are delivered, the CLI prints the options (re-run the job once PTC finishes, check progress, download manually) and the job fails with exit 7 ("translation still running in PTC"); "Re-run failed jobs" then keeps every file delivered and adds the rest. Keep it below the job timeout-minutes.'
     required: false
     default: ''
   api-url:
@@ -282,6 +282,22 @@ runs:
         [ -n "$INPUT_MONITOR_INTERVAL" ]     && args+=( --monitor-interval "$INPUT_MONITOR_INTERVAL" )
         [ -n "$INPUT_MONITOR_MAX_ATTEMPTS" ] && args+=( --monitor-max-attempts "$INPUT_MONITOR_MAX_ATTEMPTS" )
         [ -n "$INPUT_MONITOR_MAX_MINUTES" ]  && args+=( --monitor-max-minutes "$INPUT_MONITOR_MAX_MINUTES" )
+        # RR-2 (CI-16, WF-20): GitHub exports no job timeout, so with nothing naming a bound (this input,
+        # PTC_MONITOR_MAX_MINUTES, monitor_max_minutes in the config) it is sized as the agent guide sizes the GitLab job's
+        # PTC_MONITOR_MAX_MINUTES: the estimate of the configured census (ptc estimate, PTC's word rule) at about 250 words
+        # a minute plus 15 minutes, never below the CLI's 45, at most 170, under the job's timeout-minutes: 180.
+        if [ -z "$INPUT_MONITOR_MAX_MINUTES" ] && [ -z "${PTC_MONITOR_MAX_MINUTES:-}" ] && [ -n "$CONFIG" ] \
+            && ! grep -q '^monitor_max_minutes:' "$CONFIG" 2>/dev/null; then
+          est_words=$("$CLI" estimate --json -c "$CONFIG" --api-url "$INPUT_API_URL" 2>/dev/null \
+            | python3 -c 'import json, sys; print(int(json.load(sys.stdin).get("words_total") or 0))' 2>/dev/null) || est_words=0
+          case "$est_words" in ''|*[!0-9]*) est_words=0 ;; esac
+          est_minutes=$(( (est_words + 249) / 250 + 15 ))
+          if [ "$est_words" -gt 0 ] && [ "$est_minutes" -gt 45 ]; then
+            [ "$est_minutes" -gt 170 ] && est_minutes=170
+            echo "Monitor bound: $est_minutes minutes, sized from the estimate ($est_words words at about 250 a minute, plus 15)."
+            args+=( --monitor-max-minutes "$est_minutes" )
+          fi
+        fi
         # Exit 5 = partial (E20): PTC rejected some files (e.g. a processing 422) or could not be reached for them
         # (S2-R12, S2-R19), and every other file completed
         # and was written. Those translations are still delivered below; the last step then fails the job and
@@ -460,6 +476,7 @@ runs:
         PR_NUMBER: ${{ steps.cpr.outputs.pull-request-number }}
         CHECK_JSON: ${{ steps.report.outputs.guide-check-json || steps.ptc.outputs.guide-check-json }}
         PR_BRANCH: ${{ inputs.pr-branch }}
+        CLI_EXIT: ${{ steps.ptc.outputs.cli-exit }}
       run: |
         # P4 (R4, T5): ONE findings comment per translation pull request (found by PTC's marker and updated in place). PTC
         # composes it (findings, carried-string notes, next action, the project's guide page); the project setting in PTC
@@ -467,7 +484,7 @@ runs:
         set -uo pipefail
         BODY="$(mktemp "${RUNNER_TEMP:-/tmp}/ptc-guide-comment.XXXXXX")"
         MARKER="$(python3 - "$CHECK_JSON" "$BODY" "$PR_BRANCH" <<'PY_COMMENT'
-        import json, sys
+        import json, os, sys
         src, out, branch = sys.argv[1:4]
         try:
             d = json.load(open(src))
@@ -476,7 +493,9 @@ runs:
         c = d.get("comment") or {}
         if not c.get("enabled") or not c.get("body"):
             sys.exit(0)
-        post = bool(d.get("reasons") or d.get("notes"))
+        # RR-2 addendum: a run stopped with files still translating (exit 7) posts it too: the check the report step
+        # re-fetched after the stop report carries PTC's "delivery is not complete" sentence and the re-run click.
+        post = bool(d.get("reasons") or d.get("notes")) or os.environ.get("CLI_EXIT") == "7"
         # T17: the links are GitHub's own documentation pages, fetched and checked 2026-09-28 (anchors seen on the page).
         body = c["body"] + ("\n\nAuto-merge: a repository admin allows it under Settings > General > \"Pull Requests\" > \"Allow auto-merge\" "
                             "(" + "https://docs.github.com/en/repositories/configuring-branches-and-merges-in-your-repository/configuring-pull-request-merges/managing-auto-merge-for-pull-requests-in-your-repository#managing-auto-merge" + "); then anyone with write access selects \"Enable auto-merge\" on this "
@@ -567,5 +586,5 @@ runs:
       if: ${{ steps.ptc.outputs.cli-exit == '7' }}
       shell: bash
       run: |
-        echo "::error::The translation is still running in PTC: the run reached its monitor bound (the files are listed under 'Still translating in PTC' in the Translate step); the finished translations were delivered. Re-run this job once PTC finishes, or check progress / download manually with the commands printed there."
+        echo "::error::The translation is still running in PTC: the run reached its monitor bound (the files are listed under 'Still translating in PTC' in the Translate step); the finished translations were delivered. Once PTC finishes, click Re-run failed jobs: the re-run keeps every file this run delivered and adds the rest. Or check progress / download manually with the commands printed there."
         exit 7
