@@ -8,7 +8,7 @@ set -euo pipefail  # Strict mode: exit on errors, undefined variables and pipe e
 # Constants
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)" || true; readonly SCRIPT_DIR
 SCRIPT_NAME="$(basename "$0")"; readonly SCRIPT_NAME
-readonly VERSION="1.5.8"
+readonly VERSION="1.5.9"
 readonly PTC_USER_AGENT="ptc-cli/${VERSION}"
 
 # Colors for output
@@ -23,6 +23,7 @@ readonly NC='\033[0m' # No Color
 PTC_SOURCE_LOCALE=""
 PTC_PATTERNS=()
 PTC_CONFIG_FILE=""
+PTC_NOTHING_TO_DELIVER=false   # org #7638: validate_args sets it for an empty files: list
 PTC_PROJECT_DIR="$(pwd)"
 PTC_FILE_TAG_NAME=""
 PTC_LOCALE_MAP_JSON=""   # WF-5: the config's locale_map ({PTC code: file locale}) as JSON, sent with each upload
@@ -96,6 +97,21 @@ log_debug() {
     if [[ "$PTC_VERBOSE" == "true" ]]; then
         echo -e "${BLUE}[DEBUG]${NC} $*" >&2
     fi
+}
+
+# Row #7653 (ci-integrations CI-12, cli-client CLI-29): the job PTC serves comes from the running PTC and the CLI it runs
+# from a pinned release or the project's own copy (PTC_CLI_URL), so a job can be newer than its CLI. In CI (CI set, as
+# GitLab, GitHub and Bitbucket set it) the commands a job calls (the sync, guide check, mr-description, action-run,
+# delivery-commit) warn on an option this CLI does not know and go on without it; outside CI it still fails, so a typo
+# typed by hand is told. `ptc_unknown_option WHERE "$@"` returns 1 outside CI (the caller fails as before), else warns
+# once and sets PTC_UNKNOWN_SHIFT: 2 when the next word is the option's value (no `=`, the next word not an option), else 1.
+ptc_unknown_option() {
+    local where="$1" opt="$2"
+    [[ -n "${CI:-}" ]] || return 1
+    PTC_UNKNOWN_SHIFT=1
+    if [[ "$opt" != *=* && $# -ge 3 && -n "${3:-}" && "${3:-}" != -* ]]; then PTC_UNKNOWN_SHIFT=2; fi
+    log_warning "Ignored unknown option ${opt%%=*} for '${where}': this CLI (${VERSION}) is older than the CI job that calls it, so the step goes on without it. Update the CLI to use it."
+    return 0
 }
 
 # --- the API token's sources (org #7184, CLI-24) ------------------------------
@@ -1006,6 +1022,10 @@ COMMANDS:
                                    (no branch). See '$SCRIPT_NAME sync --help'.
     scan [--json]                  Census of translation resources + code usages
                                    (deterministic, no network; needs python3).
+                                   Reads YAML, PO/POT and JSON itself; lists the
+                                   paths of .strings, .xcstrings, .stringsdict,
+                                   Android XML, XLIFF, Java .properties, PHP and
+                                   CSV for PTC's project kinds to detect.
     config validate [--json]       Check .ptc-config.yml: patterns resolve, {{lang}}
                                    slot, language codes, per-language outputs.
     describe apply --file F.json   Write PTC's string descriptions into gettext #. / Chrome-i18n slots.
@@ -1305,6 +1325,77 @@ config_entry_output() {
     config_entries "$1" | awk -F '\t' -v k="${2#./}" '$1 == k { print $2; exit }'
 }
 
+# load_locale_map <"{code: locale, ...}"> <origin>
+# WF-5: sets PTC_LOCALE_MAP_FORM / _JSON / _FIELD (the upload's locale_map fields) from one flow map; a malformed pair is
+# skipped with a warning naming ORIGIN.
+load_locale_map() {
+    local body="$1" origin="$2" pair code loc _locale_pairs
+    body=$(printf '%s' "$body" | sed -E 's/^ *\{?//; s/\} *$//')
+    PTC_LOCALE_MAP_FORM=()
+    PTC_LOCALE_MAP_JSON=""
+    PTC_LOCALE_MAP_FIELD=""
+    IFS=',' read -ra _locale_pairs <<< "$body"
+    for pair in ${_locale_pairs[@]+"${_locale_pairs[@]}"}; do
+        code=$(printf '%s' "${pair%%:*}" | tr -d " '\"")
+        loc=$(printf '%s' "${pair#*:}" | tr -d " '\"")
+        if [[ ! "$code" =~ ^[A-Za-z0-9_-]{1,20}$ || ! "$loc" =~ ^[A-Za-z0-9_-]{1,20}$ ]]; then
+            log_warning "Ignoring locale_map entry '$pair' in $origin (expected <ptc code>: <file locale>)."
+            continue
+        fi
+        PTC_LOCALE_MAP_FORM+=(-F "locale_map[$code]=$loc")
+        PTC_LOCALE_MAP_JSON="${PTC_LOCALE_MAP_JSON:+$PTC_LOCALE_MAP_JSON, }\"$code\": \"$loc\""
+    done
+    if [[ -n "$PTC_LOCALE_MAP_JSON" ]]; then
+        PTC_LOCALE_MAP_JSON="{$PTC_LOCALE_MAP_JSON}"
+        PTC_LOCALE_MAP_FIELD=",
+    \"locale_map\": $PTC_LOCALE_MAP_JSON"
+    fi
+    log_debug "Loaded locale_map from $origin: $PTC_LOCALE_MAP_JSON"
+}
+
+# config_entry_maps <config file>
+# Row #7648: one "<file><TAB><locale_map value>" line per files: entry that carries its own `locale_map:` (the locales
+# of that entry's outputs, when its set names its files differently from the rest), keyed like config_entries.
+config_entry_maps() {
+    awk '
+        function clean(v) {
+            sub(/\r$/, "", v); sub(/^[ \t]+/, "", v)
+            if (v ~ /^"/) { sub(/^"/, "", v); sub(/".*$/, "", v) }
+            else if (v ~ /^\047/) { sub(/^\047/, "", v); sub(/\047.*$/, "", v) }
+            else { sub(/[ \t]+#.*$/, "", v); sub(/[ \t]+$/, "", v) }
+            sub(/^\.\//, "", v)
+            return v
+        }
+        function flush() { if (f != "" && m != "") print f "\t" m; f = ""; m = "" }
+        /^files:/ { infiles = 1; ind = -1; next }
+        !infiles { next }
+        /^[^ \t#-]/ { flush(); infiles = 0; next }
+        {
+            line = $0; sub(/\r$/, "", line)
+            if (line ~ /^[ \t]*(#|$)/) next
+            match(line, /^[ \t]*/); lead = RLENGTH
+            item = (substr(line, lead + 1, 2) == "- ")
+            if (item && (ind < 0 || lead <= ind)) { flush(); ind = lead; line = substr(line, 1, lead) "  " substr(line, lead + 3) }
+            if (line ~ /^[ \t]*file:/) { v = line; sub(/^[ \t]*file:/, "", v); if (f == "") f = clean(v) }
+            else if (line ~ /^[ \t]*locale_map:/) { v = line; sub(/^[ \t]*locale_map:[ \t]*/, "", v); sub(/\r$/, "", v); sub(/[ \t]+$/, "", v); if (m == "") m = v }
+        }
+        END { flush() }
+    ' "$1"
+}
+
+# config_entry_locale_map <repo-relative file> <base_dir>
+# The entry's own locale_map value for a file (nothing when its entry has none), looked up like its output.
+config_entry_locale_map() {
+    local rel="$1" prefix key map
+    [[ -n "$PTC_CONFIG_FILE" && -f "$PTC_CONFIG_FILE" ]] || return 0
+    prefix=$(project_dir_prefix "$2")
+    key="$rel"
+    [[ -n "$prefix" && "$rel" == "$prefix"* ]] && key="${rel#"$prefix"}"
+    map=$(config_entry_maps "$PTC_CONFIG_FILE" | awk -F '\t' -v k="${key#./}" '$1 == k { print $2; exit }')
+    [[ -z "$map" && "$key" != "$rel" ]] && map=$(config_entry_maps "$PTC_CONFIG_FILE" | awk -F '\t' -v k="${rel#./}" '$1 == k { print $2; exit }')
+    printf '%s' "$map"
+}
+
 # config_output_pattern <repo-relative file> <base_dir>
 # The config's output pattern for a file, relative to the repository root like the
 # file_path it travels with. Prints nothing when the config has no entry for it.
@@ -1365,6 +1456,14 @@ validate_args() {
             return 1
         fi
         
+        # Org #7638 (Eran, 5 Nov 2026: "Should a sync with nothing to deliver exit zero? Zero."): a files: section with
+        # no entries is nothing to deliver, a normal state; main() says so in one line and exits 0. A config with no
+        # files: section at all stays an error (parse_config_file).
+        if grep -q '^files:' "$PTC_CONFIG_FILE" 2>/dev/null && [[ -z "$(config_entries "$PTC_CONFIG_FILE")" ]]; then
+            PTC_NOTHING_TO_DELIVER=true
+            return 0
+        fi
+
         if ! parse_config_file "$PTC_CONFIG_FILE"; then
             return 1
         fi
@@ -1444,16 +1543,11 @@ substitute_pattern() {
 #     path: languages/{{lang}}.mo
 #   - type: php  
 #     path: includes/lang-{{lang}}.php
-extract_additional_files() {
-    local config_file="$1"
-    local target_file="$2"
-    
-    log_debug "Extracting additional files for: $target_file"
-    
-    # Find the section for this specific file
-    local file_section_start
-    # E27: exact match on the entry's file value (config_entries' cleaning), not a regex prefix.
-    file_section_start=$(grep -A999 '^files:' "$config_file" | awk -v k="${target_file#./}" '
+# E27: the line (within `grep -A999 '^files:'`) of the files: entry whose file value is exactly $2, compared after
+# config_entries' cleaning (YAML quotes, a trailing comment, a leading "./"); never a regex or a prefix. Org #7606: one
+# lookup for every caller, so a quoted `file: "en.lproj/Localizable.strings"` is found wherever an entry is looked up.
+_config_entry_line() {
+    grep -A999 '^files:' "$1" | awk -v k="${2#./}" '
         { l = $0; sub(/\r$/, "", l) }
         l ~ /^[ \t]*- file:/ {
             v = l; sub(/^[ \t]*- file:[ \t]*/, "", v)
@@ -1462,7 +1556,18 @@ extract_additional_files() {
             else { sub(/[ \t]+#.*$/, "", v); sub(/[ \t]+$/, "", v) }
             sub(/^\.\//, "", v)
             if (v == k) { print NR; exit }
-        }')
+        }'
+}
+
+extract_additional_files() {
+    local config_file="$1"
+    local target_file="$2"
+
+    log_debug "Extracting additional files for: $target_file"
+
+    # Find the section for this specific file
+    local file_section_start
+    file_section_start=$(_config_entry_line "$config_file" "$target_file")
     
     if [[ -z "$file_section_start" ]]; then
         return 0  # No additional files found
@@ -1560,28 +1665,11 @@ parse_config_file() {
     fi
     
     # WF-5: `locale_map: {he: he_IL, es: es_ES}` names the locale each PTC language's files use ({{lang}} expands to it).
-    local config_locale_map pair code loc _locale_pairs
-    config_locale_map=$(grep '^locale_map:' "$config_file" 2>/dev/null | sed -E 's/^locale_map: *\{?//; s/\} *$//')
+    # Row #7648: an entry's own `locale_map:` (make_ptc_api_call) replaces it for that entry's file.
+    local config_locale_map
+    config_locale_map=$(grep '^locale_map:' "$config_file" 2>/dev/null | sed 's/^locale_map://')
     if [[ -n "$config_locale_map" ]]; then
-        PTC_LOCALE_MAP_FORM=()
-        PTC_LOCALE_MAP_JSON=""
-        IFS=',' read -ra _locale_pairs <<< "$config_locale_map"
-        for pair in "${_locale_pairs[@]}"; do
-            code=$(printf '%s' "${pair%%:*}" | tr -d " '\"")
-            loc=$(printf '%s' "${pair#*:}" | tr -d " '\"")
-            if [[ ! "$code" =~ ^[A-Za-z0-9_-]{1,20}$ || ! "$loc" =~ ^[A-Za-z0-9_-]{1,20}$ ]]; then
-                log_warning "Ignoring locale_map entry '$pair' in $config_file (expected <ptc code>: <file locale>)."
-                continue
-            fi
-            PTC_LOCALE_MAP_FORM+=(-F "locale_map[$code]=$loc")
-            PTC_LOCALE_MAP_JSON="${PTC_LOCALE_MAP_JSON:+$PTC_LOCALE_MAP_JSON, }\"$code\": \"$loc\""
-        done
-        if [[ -n "$PTC_LOCALE_MAP_JSON" ]]; then
-            PTC_LOCALE_MAP_JSON="{$PTC_LOCALE_MAP_JSON}"
-            PTC_LOCALE_MAP_FIELD=",
-    \"locale_map\": $PTC_LOCALE_MAP_JSON"
-        fi
-        log_debug "Loaded locale_map from config: $PTC_LOCALE_MAP_JSON"
+        load_locale_map "$config_locale_map" "$config_file"
     fi
 
     if [[ "$PTC_API_URL" == "https://app.ptc.wpml.org/api/v1/" ]]; then
@@ -1758,7 +1846,7 @@ process_files() {
             # Check for additional_translation_files (simplified for now)
             # Look for additional files in the current entry block
             local additional_section_start
-            additional_section_start=$(grep -A999 '^files:' "$PTC_CONFIG_FILE" | grep -n "^ *- file: *$file_entry" | head -1 | cut -d: -f1)
+            additional_section_start=$(_config_entry_line "$PTC_CONFIG_FILE" "$file_entry")
             if [[ -n "$additional_section_start" ]]; then
                 local additional_files_section
                 additional_files_section=$(grep -A999 '^files:' "$PTC_CONFIG_FILE" | sed -n "${additional_section_start},/^ *- file:/p" | grep '^ *additional_translation_files:' -A10 | grep '^ *[a-zA-Z_]*:' | grep -v 'additional_translation_files:')
@@ -2250,6 +2338,24 @@ report_still_translating() {
         [[ "$state" == "reviewing" ]] && state="translated in PTC; its review holds the delivery until it finishes"
         log_warning "  ⏱ $path ($state)"
     done
+    # Row #7646 (p5 lab rerun, staging project 3715: customer research still held 18,395 of 19,383 strings at the bound and
+    # the log said only "0 of 8 file(s) done"): PTC's progress in strings (its last status answer per file, strings.total /
+    # strings.completed) and when the next retry is worth it. Said only when PTC sent the counts.
+    local body scope strings_done strings_total done_sum=0 total_sum=0 left
+    for line in "${lines[@]}"; do
+        path="${line%%$'\t'*}"
+        body=$(cat "$(ptc_status_cache_file "$path")" 2>/dev/null) || continue
+        scope=$(json_object_field "$body" "translation_status"); scope=$(json_object_field "${scope:-$body}" "strings")
+        [[ -n "$scope" ]] || continue
+        strings_done=$(json_number_field "$scope" "completed"); strings_total=$(json_number_field "$scope" "total")
+        [[ "$strings_done" =~ ^[0-9]+$ && "$strings_total" =~ ^[0-9]+$ ]] || continue
+        done_sum=$(( done_sum + strings_done )); total_sum=$(( total_sum + strings_total ))
+    done
+    if (( total_sum > 0 )); then
+        left=$(( total_sum - done_sum ))
+        log_warning "PTC's progress on these $n file(s): $done_sum of $total_sum strings translated, $left still to translate (PTC's last answer)"
+        (( left > 0 )) && log_info "Next retry: once --action status shows these $left strings translated (option (b)); a retry before that delivers only what PTC finished by then."
+    fi
     if [[ -n "$PTC_CONFIG_FILE" ]]; then
         cmd="$SCRIPT_NAME --config-file $PTC_CONFIG_FILE"
         pid=$(ptc_config_project_id "$PTC_CONFIG_FILE")
@@ -3262,6 +3368,14 @@ make_ptc_api_call() {
     local output_file_path="$3"    # Relative output path for API
     local file_tag_name="$4"
     local additional_files_json="$5"  # Optional: JSON string for additional_translation_files
+    # Row #7648: the entry's own locale_map (its set names its files with other locales than the config-wide map) rides
+    # this upload instead of the config-wide one; the globals stay as they are for the next file.
+    local -a PTC_LOCALE_MAP_FORM=(${PTC_LOCALE_MAP_FORM[@]+"${PTC_LOCALE_MAP_FORM[@]}"})
+    local PTC_LOCALE_MAP_JSON="$PTC_LOCALE_MAP_JSON" PTC_LOCALE_MAP_FIELD="$PTC_LOCALE_MAP_FIELD" entry_locale_map=""
+    if [[ -n "$PTC_CONFIG_FILE" ]]; then
+        entry_locale_map=$(config_entry_locale_map "$relative_file_path" "$(get_base_directory 2>/dev/null || true)")
+        [[ -n "$entry_locale_map" ]] && load_locale_map "$entry_locale_map" "$PTC_CONFIG_FILE ($relative_file_path)"
+    fi
     
     # Check if file exists
     if [[ ! -f "$absolute_file_path" ]]; then
@@ -3445,6 +3559,25 @@ refused_rest() {
 }
 
 # Function to start processing of uploaded file
+# GIT-30 (Git revamp R3, plan 9): the commit a process upload comes from, resolved as the guide report resolves it
+# (CI_COMMIT_SHA or GITHUB_SHA, else the checkout's HEAD), into UPLOAD_COMMIT_SHA (no subshell, so the warning is
+# printed once per run). Empty when none resolves to a full sha (PTC groups commit-less uploads by time until 2027-02-03 and refuses them on git-connected
+# projects after that).
+resolve_upload_commit() {
+    UPLOAD_COMMIT_SHA=""
+    local sha="${CI_COMMIT_SHA:-${GITHUB_SHA:-}}"
+    [[ -z "$sha" ]] && sha=$(git -C "${PTC_PROJECT_DIR:-.}" rev-parse HEAD 2>/dev/null || true)
+    if [[ "$sha" =~ ^[0-9a-fA-F]{40}([0-9a-fA-F]{24})?$ ]]; then
+        UPLOAD_COMMIT_SHA="$sha"
+        return 0
+    fi
+    if [[ -z "${PTC_UPLOAD_COMMIT_WARNED:-}" ]]; then
+        PTC_UPLOAD_COMMIT_WARNED=1
+        log_warning "Could not resolve the commit this upload comes from (set CI_COMMIT_SHA or GITHUB_SHA, or run inside the git checkout): uploads without a commit are grouped by time until 2027-02-03 and refused on git-connected projects after that"
+    fi
+    return 0
+}
+
 start_processing() {
     local absolute_file_path="$1"
     local relative_file_path="$2"
@@ -3481,6 +3614,10 @@ start_processing() {
         output_form+=(--form-string "additional_translation_files[][type]=${companion_types[$i]}"
                       --form-string "additional_translation_files[][path]=${companion_paths[$i]}")
     done
+
+    # GIT-30 (plan 9): the commit rides as one form field.
+    resolve_upload_commit
+    [[ -n "$UPLOAD_COMMIT_SHA" ]] && output_form+=(--form-string "commit=$UPLOAD_COMMIT_SHA")
 
     # Make multipart/form-data request using curl
     local response
@@ -3930,9 +4067,18 @@ ptc_run_key() {
     printf '%s' "$key"
 }
 
+# Row #7645: with --written-manifest, the run's shas and outs lines also go to "<manifest>.delivered", which outlives
+# the run state (a run that ends successfully clears it, before the job's push step): `ptc guide mr-description` reads
+# the languages of the delivery from it.
+ptc_run_delivered_put() {
+    [[ -n "$PTC_WRITTEN_MANIFEST" ]] || return 0
+    printf '%s\n' "$1" >> "$PTC_WRITTEN_MANIFEST.delivered" 2>/dev/null || true
+}
+
 # The shas ("<iso>=<sha>,...") this run wrote for a file: the X-PTC-Delivered-Shas of its download.
 ptc_run_state_put_shas() {
     local state
+    ptc_run_delivered_put "shas"$'\t'"$1"$'\t'"$2"
     state=$(ptc_run_state_file)
     [[ -f "$state" ]] || return 0
     printf 'shas\t%s\t%s\n' "$1" "$2" >> "$state" 2>/dev/null || true
@@ -3959,6 +4105,7 @@ ptc_run_state_put_outs() {  # $1 = file, $2 = list of absolute written paths (on
         line="$line"$'\t'"$sha"$'\t'"$out"
     done < "$2"
     printf '%s\n' "$line" >> "$state" 2>/dev/null || true
+    ptc_run_delivered_put "$line"
 }
 
 ptc_sha256_file() {
@@ -4609,13 +4756,31 @@ render_ptc_config() {
     fi
 }
 
+# Org #7606: a config value as PTC's guide writes it (Guide::Tasks::CommitConfig.yaml_value): plain when YAML reads the
+# plain form back as the same string, else a double-quoted scalar (`output: "{{lang}}.lproj/Localizable.strings"`: plain,
+# a leading `{` opens a flow mapping and the file is not YAML). Without a YAML parser at hand the plain test is the YAML
+# 1.1 plain-scalar rules, erring towards quotes; every reader of the config takes either form.
+_yaml_scalar() {
+    local v="$1" quote=0
+    if [[ -z "$v" || "$v" =~ ^[[:space:]] || "$v" =~ [[:space:]]$ || "$v" =~ [[:cntrl:]] ]]; then quote=1
+    elif [[ "$v" =~ ^[-?:]([[:space:]]|$) ]]; then quote=1
+    elif [[ "$v" == *": "* || "$v" == *" #"* || "$v" == *: ]]; then quote=1
+    elif [[ "$v" =~ ^(y|Y|yes|Yes|YES|n|N|no|No|NO|true|True|TRUE|false|False|FALSE|on|On|ON|off|Off|OFF|null|Null|NULL|~|<<|=)$ ]]; then quote=1
+    elif [[ "$v" =~ ^[-+]?[0-9._:]*[0-9][0-9._:]*([eE][-+]?[0-9]+)?$ || "$v" =~ ^[-+]?0[xXoObB] || "$v" =~ ^[-+]?\.[A-Za-z] || "$v" =~ ^[0-9]{4}-[0-9]{1,2}-[0-9]{1,2} ]]; then quote=1
+    fi
+    case "${v:0:1}" in '['|']'|'{'|'}'|'#'|'&'|'*'|'!'|'|'|'>'|"'"|'"'|'%'|'@'|'`'|',') quote=1 ;; esac
+    if (( quote == 0 )); then printf '%s' "$v"; return; fi
+    v=${v//\\/\\\\}; v=${v//\"/\\\"}; v=${v//$'\n'/\\n}; v=${v//$'\r'/\\r}; v=${v//$'\t'/\\t}
+    printf '"%s"' "$v"
+}
+
 _render_config_detected() {
     local source_locale="$1" kind="$2" files_elems="$3"
     printf '# .ptc-config.yml — generated by `%s init`\n' "$SCRIPT_NAME"
     [[ -n "$kind" ]] && printf '# Detected project kind: %s\n' "$kind"
     printf '# Never commit an API token — provide it via the PTC_API_TOKEN environment variable.\n'
     printf '\n'
-    printf 'source_locale: %s\n' "$source_locale"
+    printf 'source_locale: %s\n' "$(_yaml_scalar "$source_locale")"
     printf '\n'
     printf 'files:\n'
     local elem file output addl_elems addl a_type a_path
@@ -4624,8 +4789,8 @@ _render_config_detected() {
         file=$(json_string_field "$elem" "file")
         [[ -z "$file" ]] && continue
         output=$(json_string_field "$elem" "output")
-        printf '  - file: %s\n' "$file"
-        printf '    output: %s\n' "$output"
+        printf '  - file: %s\n' "$(_yaml_scalar "$file")"
+        printf '    output: %s\n' "$(_yaml_scalar "$output")"
         addl_elems=$(_json_array_elements "$elem" "additional_translation_files")
         if [[ -n "$addl_elems" ]]; then
             printf '    additional_translation_files:\n'
@@ -4633,8 +4798,8 @@ _render_config_detected() {
                 [[ -z "$addl" ]] && continue
                 a_type=$(json_string_field "$addl" "type")
                 a_path=$(json_string_field "$addl" "path")
-                printf '      - type: %s\n' "$a_type"
-                printf '        path: %s\n' "$a_path"
+                printf '      - type: %s\n' "$(_yaml_scalar "$a_type")"
+                printf '        path: %s\n' "$(_yaml_scalar "$a_path")"
             done <<< "$addl_elems"
         fi
     done <<< "$files_elems"
@@ -4699,6 +4864,8 @@ detect_ci_provider() {
     fi
     if [[ -d "$dir/.github" ]] || [[ "$origin" == *github.com* ]]; then
         echo "github"
+    elif [[ -f "$dir/bitbucket-pipelines.yml" ]] || [[ "$origin" == *bitbucket.org* ]]; then
+        echo "bitbucket"
     elif [[ -f "$dir/.gitlab-ci.yml" ]] || [[ "$origin" == *gitlab* ]]; then
         echo "gitlab"
     else
@@ -4876,7 +5043,11 @@ ptc-translate:
       fi
       if ! git diff --cached --quiet; then
         git commit -m "chore(i18n): update translations via PTC [skip translations]"
-        ptc_mr_description="\$(/tmp/ptc-cli.sh guide mr-description --file /tmp/ptc-check.json)"
+        # A CLI older than this job (another PTC_CLI_URL copy, an older release) may not know --written-manifest:
+        # the job passes it only when the CLI's help names it for mr-description.
+        ptc_written_arg=""
+        case "\$(/tmp/ptc-cli.sh guide --help 2>/dev/null || true)" in *"mr-description --file CHECK.json [--written-manifest"*) ptc_written_arg="--written-manifest /tmp/ptc-written" ;; esac
+        ptc_mr_description="\$(/tmp/ptc-cli.sh guide mr-description --file /tmp/ptc-check.json \$ptc_written_arg)"
         git push -o merge_request.create \\
                  -o merge_request.target="\$CI_DEFAULT_BRANCH" \\
                  -o merge_request.title="Update translations from PTC" \\
@@ -4895,6 +5066,139 @@ ptc-translate:
 EOF
 }
 
+# R7525 (AGD-11): the Bitbucket Pipelines recipe (bitbucket-pipelines.yml), the GitLab job step for step: the CLI fetched
+# through PTC's counted door, the guide action-run (the step's OIDC token, audience ptc), the check, the run, the push of
+# ptc/translations and its pull request. The agent guide serves this output byte for byte
+# (backend/app/services/guide/bitbucket_pipelines_recipe.yml.tmpl; cli/tests/test-guide-bitbucket-recipe.sh).
+render_ci_bitbucket() {
+    local door="${PTC_API_URL:-}"
+    door="${door%%/api/*}"
+    door="${door%/}"
+    [[ -n "$door" ]] || door="https://app.ptc.wpml.org"
+    sed -e "s#__PTC_CLI_HOST__#${door}#" -e "s#__PTC_CLI_VERSION__#${VERSION}#" <<'EOF'
+# PTC translates pushes to the default branch (main below: name yours if it differs), and Run pipeline > ptc-translate
+# (or a schedule of it) runs the step again with no new commit: it delivers what PTC finished since the last run.
+image: alpine:3.22
+
+definitions:
+  steps:
+    - step: &ptc-translate
+        name: PTC translate
+        # 120 minutes, the most every Bitbucket plan accepts (a Free workspace refuses more when it parses this file). The
+        # CLI stops at its own 45-minute bound (monitor_max_minutes in .ptc-config.yml), delivers what finished and exits 7
+        # (CI-16). PTC keeps translating; the next run delivers the rest and translates nothing again.
+        max-time: 120
+        # The step's identity token (BITBUCKET_STEP_OIDC_TOKEN, audience ptc) proves to PTC that this pipeline ran the
+        # commit (agent guide provenance).
+        oidc:
+          audiences:
+            - ptc
+        script:
+          # jq is never invoked by the CLI. unzip is - it unpacks the downloaded translations; alpine already provides it
+          # as a busybox applet, so it is named here only to keep the step working if the image is ever changed. git is
+          # needed by the push below, not by the CLI.
+          - apk add --no-cache bash curl git unzip python3
+          # Loop-safe: the translation push targets ptc/translations and its commit carries [skip translations], which
+          # this line refuses. Not [skip ci]: that would also skip the pipelines of the pull request itself.
+          - if git log -1 --pretty=%B "$BITBUCKET_COMMIT" | grep -qF '[skip translations]'; then echo "A PTC translation commit ([skip translations]), nothing to translate."; exit 0; fi
+          # The preflight writes the CI-time limit note here (balance short of the census); the pull request description
+          # below carries it, as a GitHub pull request body does.
+          - export PTC_LIMIT_NOTE_FILE=/tmp/ptc-limit-note
+          # Downloaded OUTSIDE the checkout: anything this step writes into the working tree is a file the commit below
+          # could sweep into the pull request, and the CLI is 100+ KB of it.
+          # Fetched through PTC's CLI door, which counts the download and redirects to the release tag.
+          # A repository variable PTC_CLI_URL pins another copy of the CLI (curl accepts file://, e.g.
+          # file://$BITBUCKET_CLONE_DIR/cli/ptc-cli.sh for the repository's own).
+          - curl -fsSL "${PTC_CLI_URL:-__PTC_CLI_HOST__/cli/v__PTC_CLI_VERSION__/ptc-cli.sh}" -o /tmp/ptc-cli.sh
+          - chmod +x /tmp/ptc-cli.sh
+          - rm -f /tmp/ptc-written /tmp/ptc-limit-note
+          # Report the run to PTC's agent guide (scan, config digests, identity token); never fails the step.
+          - /tmp/ptc-cli.sh guide action-run --config-file .ptc-config.yml || true
+          # Check first (agent guide): PTC reports missing information for this commit; it never withholds the translation.
+          # PTC_API_TOKEN is the secured repository variable PTC asks for (your agent token).
+          - PTC_ORG_TOKEN="$PTC_API_TOKEN" /tmp/ptc-cli.sh guide check --json --config-file .ptc-config.yml > /tmp/ptc-check.json || true
+          # The pull request's description carries PTC's findings (set below; the project setting in PTC turns them off).
+          # They are printed here too, so every step log shows them, also when there is nothing new to push.
+          - ptc_mr_description="$(/tmp/ptc-cli.sh guide mr-description --file /tmp/ptc-check.json)"
+          # Exit 5 = partial: PTC rejected some files or could not be reached for them, and every other file was written.
+          # Exit 6 = partial: some files wait in PTC (an over-limit approval, or paused out-of-credit) and every other file
+          # was written. Exit 7 = the translation is still running in PTC at the CLI's monitor bound and every finished file
+          # was written. Deliver those below, then fail the step at the end with the reason.
+          - ptc_rc=0
+          - /tmp/ptc-cli.sh --config-file .ptc-config.yml --written-manifest /tmp/ptc-written || ptc_rc=$?
+          - if [ "$ptc_rc" -ne 0 ] && [ "$ptc_rc" -ne 5 ] && [ "$ptc_rc" -ne 6 ] && [ "$ptc_rc" -ne 7 ]; then exit "$ptc_rc"; fi
+          # Exit 7: the delivery-commit report below tells PTC the run stopped while it was still translating.
+          - ptc_stopped=""; if [ "$ptc_rc" -eq 7 ]; then ptc_stopped="--stopped-reason monitor_bound"; fi
+          # Pipelines pushes back to its own repository through the HTTP origin it sets up (no credential needed unless
+          # branch permissions cover ptc/translations). Opening the pull request needs the secured repository variable
+          # PTC_BITBUCKET_PR_TOKEN (a repository access token with the Pull requests: Write scope); without it the step
+          # prints the link that opens it.
+          # Staged from the manifest, so the pull request carries the translations and nothing else - not this step's
+          # downloads, not whatever an earlier step left in the working directory. Exit 1 from git add is tolerated: a
+          # translation on a path your .gitignore covers makes git exit 1 while still staging everything else. Staging
+          # comes BEFORE the check, and the check reads the index: on the first run the translations are new files. The
+          # manifest's paths are relative to the repository root, and a step may run from a subdirectory (a suite step
+          # starts with `cd <product dir>`), so the staging runs at the root. A file the run wrote that is still unstaged
+          # after it means git matched none of the paths: the step says so and fails, never a green step without a pull
+          # request.
+          - |
+            git config user.email "ci@ptc"
+            git config user.name "PTC Translate"
+            git checkout -B ptc/translations
+            ptc_top="$(git rev-parse --show-toplevel)"
+            ptc_add_rc=0
+            git -C "$ptc_top" add --pathspec-from-file=/tmp/ptc-written --pathspec-file-nul || ptc_add_rc=$?
+            # 1 = some path is ignored (the rest is staged); 128 = a path matched nothing and git staged NOTHING.
+            if [ "$ptc_add_rc" -gt 1 ]; then
+              echo "git add of the translations this run wrote failed (exit $ptc_add_rc), so nothing was staged for the pull request."
+              exit 1
+            fi
+            if [ -s /tmp/ptc-written ]; then
+              ptc_unstaged="$(xargs -0 git -C "$ptc_top" status --porcelain --untracked-files=all -- < /tmp/ptc-written | grep '^.[^ ]' || true)"
+              if [ -n "$ptc_unstaged" ]; then
+                echo "PTC wrote these translations, but they were not staged for the pull request (git add matched none of them):"
+                echo "$ptc_unstaged"
+                exit 1
+              fi
+            fi
+            if ! git diff --cached --quiet; then
+              git commit -m "chore(i18n): update translations via PTC [skip translations]"
+              # A CLI older than this job (another PTC_CLI_URL copy, an older release) may not know --written-manifest:
+              # the job passes it only when the CLI's help names it for mr-description.
+              ptc_written_arg=""
+              case "$(/tmp/ptc-cli.sh guide --help 2>/dev/null || true)" in *"mr-description --file CHECK.json [--written-manifest"*) ptc_written_arg="--written-manifest /tmp/ptc-written" ;; esac
+              ptc_mr_description="$(/tmp/ptc-cli.sh guide mr-description --file /tmp/ptc-check.json $ptc_written_arg)"
+              git push -f origin HEAD:ptc/translations
+              if [ -n "${PTC_BITBUCKET_PR_TOKEN:-}" ]; then
+                # No destination: Bitbucket opens the pull request against the repository's main branch. An open one from
+                # ptc/translations already carries the push (Bitbucket then answers 400: printed, never fatal).
+                PTC_PR_DESCRIPTION="$ptc_mr_description" python3 -c 'import json, os; print(json.dumps({"title": "Update translations from PTC", "source": {"branch": {"name": "ptc/translations"}}, "description": os.environ["PTC_PR_DESCRIPTION"]}))' > /tmp/ptc-pr.json
+                ptc_pr_code="$(curl -sS -o /tmp/ptc-pr-answer.json -w '%{http_code}' -X POST -H "Authorization: Bearer $PTC_BITBUCKET_PR_TOKEN" -H "Content-Type: application/json" --data @/tmp/ptc-pr.json "https://api.bitbucket.org/2.0/repositories/$BITBUCKET_REPO_FULL_NAME/pullrequests" || true)"
+                echo "Bitbucket answered HTTP $ptc_pr_code to opening the pull request from ptc/translations."
+              else
+                echo "Open the pull request from ptc/translations: https://bitbucket.org/$BITBUCKET_REPO_FULL_NAME/pull-requests/new?source=ptc/translations (a secured repository variable PTC_BITBUCKET_PR_TOKEN lets this step open it)."
+              fi
+              # PTC observes its delivery on the translations branch (P4 T14): the commit and its delivered files'
+              # sha256 (S2-R14: a trusted report of PTC's delivery on the translations branch is the delivery proof).
+              /tmp/ptc-cli.sh guide delivery-commit --commit "$(git rev-parse HEAD)" --branch ptc/translations --source-commit "$BITBUCKET_COMMIT" --config-file .ptc-config.yml $ptc_stopped || true
+            elif [ -n "$ptc_stopped" ]; then
+              # Nothing finished inside the bound: PTC still hears that this run stopped, so the guide says "re-run the step".
+              /tmp/ptc-cli.sh guide delivery-commit $ptc_stopped --source-commit "$BITBUCKET_COMMIT" --config-file .ptc-config.yml || true
+            fi
+          - if [ "$ptc_rc" -eq 5 ]; then echo "PTC rejected some files or could not be reached for them (see 'Rejected by PTC' / 'Could not reach PTC' above); the rest was delivered."; exit 5; fi
+          - if [ "$ptc_rc" -eq 6 ]; then echo "Some files wait in PTC - parked for an over-limit approval, or paused out-of-credit (see the lists above); the rest was delivered. Approve in PTC or top up the credit, then re-run."; exit 6; fi
+          - if [ "$ptc_rc" -eq 7 ]; then echo "The translation is still running in PTC (see 'Still translating in PTC' above); the finished files were delivered. Run the pipeline again (Run pipeline > ptc-translate) once PTC finishes, or check progress / download manually with the commands printed there."; exit 7; fi
+
+pipelines:
+  branches:
+    main:
+      - step: *ptc-translate
+  custom:
+    ptc-translate:
+      - step: *ptc-translate
+EOF
+}
+
 # Prints the CI snippet matching the detected provider (both, when unknown).
 print_ci_block() {
     local dir="$1"
@@ -4910,6 +5214,10 @@ print_ci_block() {
         gitlab)
             printf '\n# append to .gitlab-ci.yml\n'
             render_ci_gitlab
+            ;;
+        bitbucket)
+            printf '\n# bitbucket-pipelines.yml (PTC_API_TOKEN as a secured repository variable: Repository settings > Pipelines > Repository variables)\n'
+            render_ci_bitbucket
             ;;
         *)
             printf '\n# GitHub Actions — .github/workflows/ptc.yml:\n'
@@ -5501,6 +5809,75 @@ def workspace_fingerprint(root, sets, named=None):
     return hashlib.sha256("".join(sorted(entries)).encode("utf-8")).hexdigest()
 
 
+# Row #7581 (one resource-file detector): the paths PTC's project kinds (the Git route's detector) read to name the source
+# sets of the formats this scan does not read itself. Every non-vendored path with a PTC-supported resource extension (PHP
+# only under a locale-shaped directory, as the Git route offers it) or a project-kind marker; capped, and said when capped.
+RESOURCE_EXTS = {"xliff", "xlf", "mqxliff", "sdlxliff", "mxliff", "xcstrings", "json", "yml", "yaml", "csv", "tsv", "po", "pot",
+                 "mo", "strings", "stringsdict", "xml", "plist", "properties"}
+CLI_READ_EXTS = {"yml", "yaml", "po", "pot", "json"}
+KIND_MARKERS = {"Info.plist", "AndroidManifest.xml", "Gemfile", "package.json", "artisan", "composer.json", "style.css"}
+LOCALE_DIRS = {"lang", "locale", "locales", "i18n", "l10n", "translations"}
+# Row #7652: the Interface Builder files (storyboards, xibs) whose <Name>.strings Xcode loads by object id, not by a code
+# call: PTC's scope check never proposes dropping a .strings file one of them loads. Sent with the paths, never read.
+INTERFACE_EXTS = {"storyboard", "xib"}
+MAX_RESOURCE_PATHS = 5000
+
+
+def resource_ext(path):
+    return os.path.splitext(path)[1].lower().lstrip(".")
+
+
+def resource_path(path):
+    ext = resource_ext(path)
+    if ext in RESOURCE_EXTS:
+        return True
+    if ext in ("php", "inc"):
+        return any(d.lower() in LOCALE_DIRS or re.match(r"^[a-z]{2}([_-]([A-Za-z]{2}|[A-Z][a-z]{3}))?$", d) for d in path.split("/")[:-1])
+    return False
+
+
+# Row #7641 (Eran 5 Nov 2026): the paths the project kinds would name as a resource set's file, the catalogue and template
+# files of every supported format: gettext .po/.pot, iOS .strings/.xcstrings/.stringsdict, Android res/values*/strings.xml,
+# YAML and JSON under a locale directory (Rails config/locales) or named by a language, XLIFF, Java .properties, PHP arrays
+# under a locale directory, CSV/TSV. The listing carries them (after the kind markers) before the rest, and the cap applies
+# after, so a set whose file sorts last is never cut from a truncated listing.
+KIND_NAMED_EXTS = {"po", "pot", "strings", "stringsdict", "xcstrings", "xliff", "xlf", "mqxliff", "sdlxliff", "mxliff",
+                   "properties", "csv", "tsv"}
+
+
+def kind_named(path):
+    ext = resource_ext(path)
+    parts = path.split("/")
+    dirs = [d.lower() for d in parts[:-1]]
+    if ext in KIND_NAMED_EXTS:
+        return True
+    if ext == "xml":
+        return parts[-1] == "strings.xml" and bool(dirs) and dirs[-1].startswith("values")
+    if ext in ("yml", "yaml", "json"):
+        return any(d in LOCALE_DIRS for d in dirs) or lang_template(path) is not None
+    if ext in ("php", "inc"):
+        return resource_path(path)
+    return False
+
+
+def resource_paths(files):
+    markers = [f for f in files if os.path.basename(f) in KIND_MARKERS or (".xcodeproj/" in f and f.endswith("/project.pbxproj"))]
+    resources = [f for f in files if not NON_PRODUCT.search(f) and (resource_path(f) or resource_ext(f) in INTERFACE_EXTS)]
+    named = [f for f in resources if kind_named(f)]
+    paths = list(dict.fromkeys(markers + named + resources))
+    return paths[:MAX_RESOURCE_PATHS], len(paths) > MAX_RESOURCE_PATHS
+
+
+def none_reason(paths):
+    unread = sorted({resource_ext(p) for p in paths if resource_path(p) and resource_ext(p) not in CLI_READ_EXTS | {"plist", "mo"}})
+    base = "no translation resource files found (looked for Rails YAML, gettext .pot/.po, JSON locale files)"
+    if not unread:
+        return base
+    counts = ", ".join("%s: %d file(s)" % (e, sum(1 for p in paths if resource_ext(p) == e)) for e in unread)
+    return ("no Rails YAML, gettext .pot/.po or JSON locale files found; the tree holds files of formats PTC supports that this "
+            "scan does not read itself (%s): PTC detects their source sets from resource_paths when the census is submitted" % counts)
+
+
 def scan(root, source_locale, config_pairs):
     root = os.path.abspath(root)
     files = list_files(root)
@@ -5607,6 +5984,10 @@ def scan(root, source_locale, config_pairs):
             fmt = "po" if ext in (".po", ".pot") else "yaml" if ext in (".yml", ".yaml") else "json"
             add_set(fmt, out, paths, set())
 
+    ios_keys = ios_source_keys(root, files, src, keep_empty=True)
+    for p, keys in ios_keys.items():
+        if keys:
+            usage_keys.setdefault(p, ("strings", keys))  # row 7619: the iOS sources key the Swift / Objective-C usages
     usages = build_usages(root, files, usage_keys)
     fw = set()
     for s in sets:
@@ -5615,6 +5996,7 @@ def scan(root, source_locale, config_pairs):
     db = git(root, "symbolic-ref", "--short", "refs/remotes/origin/HEAD").split("/", 1)[-1] or git(root, "rev-parse", "--abbrev-ref", "HEAD") or "main"
     v2 = census_v2(root, files, sets)
     prefix = git(root, "rev-parse", "--show-prefix").rstrip("/")
+    rpaths, rtruncated = resource_paths(files)
     return {"schema": 2, "cli_version": os.environ.get("PTC_CLI_VERSION", ""),
             "repo": {"root": ".", "head_sha": head or None, "default_branch": db, "prefix": prefix,
                      "workspace_fingerprint": workspace_fingerprint(root, sets)},
@@ -5625,7 +6007,16 @@ def scan(root, source_locale, config_pairs):
             "other_string_sources": v2["other_string_sources"], "partition": v2["partition"],
             "existing_translations": v2["existing_translations"], "runtime": v2["runtime"],
             "usages_unmatched": v2["usages_unmatched"],
-            "none_reason": None if sets else "no translation resource files found (looked for Rails YAML, gettext .pot/.po, JSON locale files)"}
+            "none_reason": None if sets else none_reason(rpaths),
+            # #6628: where the source locale came from - "config" (.ptc-config.yml source_locale), "flag" (-s) or null (the
+            # en default); only a declared one is the user's choice. Appended last: every earlier key is unchanged.
+            "source_locale": {"code": src, "declared": os.environ.get("PTC_SCAN_SOURCE_DECLARED") or None},
+            # Row #7581: the candidate resource paths PTC's project kinds detect the other formats' sets from.
+            "resource_paths": rpaths, "resource_paths_truncated": rtruncated,
+            # Row #7649: the key count of each iOS source catalogue the scan reads but builds no set for (.strings of the
+            # source or Base .lproj, .xcstrings); PTC puts it on the set its project kinds detect for the file, so the
+            # audit verdict and the scope check name the file's keys, never 0 for a catalogue nobody counted.
+            "source_key_counts": {p: len(set(keys)) for p, keys in sorted(ios_keys.items())}}
 
 
 # ---------------- census v2 (schema 2) ----------------
@@ -6052,12 +6443,55 @@ def gettext_first_argument(text, pos, first_by=None):
         return "".join(parts) if text[pos:pos + 1] in (",", ")") else None
 
 
+# Row 7619: iOS. The source catalogues are the .strings of the source-language (or Base) .lproj and the String Catalogs
+# (.xcstrings, every language in one file); `ptc scan` builds no resource set for them (PTC detects those sets with its
+# project kinds, Guide::ResourceDetector) but keys the Swift / Objective-C usages by them, and the string audit's iOS
+# recipe reads their keys (a SwiftUI Text("key") whose literal is a key is translated, any other literal is not).
+IOS_SOURCE_EXT = (".strings", ".xcstrings")
+IOS_CODE_EXT = {".swift", ".m", ".mm"}
+IOS_STRINGS_ENTRY_RE = re.compile(r'"((?:[^"\\]|\\.)*)"\s*=\s*"(?:[^"\\]|\\.)*"\s*;')
+# The key (group 1) of a localisation call: NSLocalizedString / String(localized:) / LocalizedStringKey, or a SwiftUI view
+# whose string literal is a LocalizedStringKey (Text, Button, Label, Toggle, navigationTitle).
+IOS_KEY_RE = re.compile(r'(?:\bNSLocalizedString\(|\bString\(localized:|\bLocalizedStringKey\(|\b(?:Text|Button|Label|Toggle)\(|'
+                        r'\.navigationTitle\()\s*@?"((?:[^"\\]|\\.)*)"')
+
+
+def ios_read_text(path):
+    """A .strings file is UTF-8 or UTF-16 (Xcode's older default, with a BOM)."""
+    data = open(path, "rb").read()
+    if data[:2] in (b"\xff\xfe", b"\xfe\xff"):
+        return data.decode("utf-16", errors="replace")
+    return data.decode("utf-8-sig", errors="replace")
+
+
+def ios_source_keys(root, files, source_locale="en", keep_empty=False):
+    """{source catalogue path: [keys]}: the .strings in <source>.lproj / Base.lproj, and every .xcstrings (row 7649:
+    keep_empty keeps a catalogue that holds no key, so its count is 0 read, not unknown)."""
+    src = (source_locale or "en").split("_")[0].split("-")[0]
+    out = {}
+    for f in files:
+        if NON_PRODUCT.search(f):
+            continue
+        parent = os.path.basename(os.path.dirname(f)).lower()
+        try:
+            if f.endswith(".strings") and parent in (src + ".lproj", "base.lproj", source_locale.lower() + ".lproj"):
+                out[f] = [m.group(1) for m in IOS_STRINGS_ENTRY_RE.finditer(re.sub(r"/\*.*?\*/", "", ios_read_text(os.path.join(root, f)), flags=re.S))]
+            elif f.endswith(".xcstrings"):
+                cat = json.loads(ios_read_text(os.path.join(root, f)))
+                out[f] = list((cat.get("strings") or {}) if isinstance(cat, dict) else [])
+        except (OSError, ValueError):
+            continue
+    return {k: v for k, v in out.items() if v or keep_empty}
+
+
 def build_usages(root, files, usage_keys):
-    key_index, msgid_index, ns_index = {}, {}, {}
+    key_index, msgid_index, ns_index, ios_index = {}, {}, {}, {}
     for path, (fmt, keys) in usage_keys.items():
         for k in keys:
             if fmt == "po":
                 msgid_index.setdefault(k, []).append(path)
+            elif fmt == "strings":
+                ios_index.setdefault(k, []).append(path)
             else:
                 key_index.setdefault(k, []).append(path)
                 if fmt == "json":
@@ -6067,10 +6501,20 @@ def build_usages(root, files, usage_keys):
     def add(src_paths, key, path, line, text):
         for sp in src_paths:
             usages.setdefault(sp, {}).setdefault(key, []).append({"path": path, "line": line, "text": text})
-    if not (key_index or msgid_index):
+    if not (key_index or msgid_index or ios_index):
         return {}
     for f in files:
         ext = os.path.splitext(f)[1].lower()
+        if ext in IOS_CODE_EXT and ios_index:
+            try:
+                with open(os.path.join(root, f), encoding="utf-8", errors="replace") as fh:
+                    for no, line in enumerate(fh, 1):
+                        for k in dict.fromkeys(m.group(1) for m in IOS_KEY_RE.finditer(line)):
+                            if k in ios_index:
+                                add(ios_index[k], k, f, no, line.strip()[:200])
+            except OSError:
+                pass
+            continue
         if ext not in CODE_EXT:
             continue
         try:
@@ -6135,6 +6579,9 @@ def read_config(path):
             m = re.match(r"^\s*output:\s*(.+?)\s*$", line)
             if m and cur is not None:
                 cur["output"] = unquote(m.group(1))
+            m = re.match(r"^\s+locale_map:\s*(.+?)\s*$", line)
+            if m and cur is not None:  # row #7648: the entry's own file locales
+                cur["locale_map"] = m.group(1)
         elif section == "guide":
             m = re.match(r"^\s+(\w+):\s*(.*?)\s*$", line)
             if m:
@@ -6170,25 +6617,33 @@ def config_validate(root, path):
     for l in langs:
         if not is_lang(l):
             errors.append(f"guide.languages: '{l}' is not a known language code")
-    locale_map = {}
-    raw_map = cfg.get("locale_map")
-    if raw_map:  # WF-5: {PTC code: file locale}; {{lang}} expands to the file locale
+    def parse_map(raw_map, where):
+        """WF-5: {PTC code: file locale}; {{lang}} expands to the file locale. Malformed pairs are named under WHERE."""
+        parsed = {}
         body = raw_map.strip()
         if not (body.startswith("{") and body.endswith("}")):
-            errors.append(f"locale_map '{raw_map}' is not a {{code: locale, ...}} map")
-        else:
-            for pair in [x for x in body[1:-1].split(",") if x.strip()]:
-                code, _, loc = pair.partition(":")
-                code, loc = unquote(code.strip()), unquote(loc.strip())
-                if not is_lang(code):
-                    errors.append(f"locale_map: '{code}' is not a known language code")
-                elif not re.match(r"^[A-Za-z0-9_-]{1,20}$", loc):
-                    errors.append(f"locale_map: '{code}' maps to '{loc}', not a locale token")
-                else:
-                    locale_map[code] = loc
+            errors.append(f"{where} '{raw_map}' is not a {{code: locale, ...}} map")
+            return parsed
+        for pair in [x for x in body[1:-1].split(",") if x.strip()]:
+            code, _, loc = pair.partition(":")
+            code, loc = unquote(code.strip()), unquote(loc.strip())
+            if not is_lang(code):
+                errors.append(f"{where}: '{code}' is not a known language code")
+            elif not re.match(r"^[A-Za-z0-9_-]{1,20}$", loc):
+                errors.append(f"{where}: '{code}' maps to '{loc}', not a locale token")
+            else:
+                parsed[code] = loc
+        return parsed
+    locale_map = {}
+    if cfg.get("locale_map"):
+        locale_map = parse_map(cfg["locale_map"], "locale_map")
         cfg["locale_map"] = locale_map
     for i, e in enumerate(cfg["files"], 1):
+        if isinstance(e.get("locale_map"), str):  # row #7648: an entry's own map replaces the config-wide one for it
+            e["locale_map"] = parse_map(e["locale_map"], f"files[{i}].locale_map")
+    for i, e in enumerate(cfg["files"], 1):
         fpat, out = e.get("file", ""), e.get("output", "")
+        entry_map = e["locale_map"] if isinstance(e.get("locale_map"), dict) else locale_map
         matches = [f for f in all_files if fnmatch_path(f, fpat)]
         entry = {"file": fpat, "output": out, "matches": len(matches), "outputs": {}}
         if not matches:
@@ -6200,6 +6655,10 @@ def config_validate(root, path):
             errors.append(f"files[{i}] has no output")
         elif not LANG_SLOT.search(out) and len(langs) == 1:
             entry["outputs"][langs[0]] = out
+        elif not LANG_SLOT.search(out) and out == fpat and fpat.lower().endswith(".xcstrings"):
+            # #7581: a String Catalog holds every language in one file; PTC writes each language into the catalog itself.
+            for l in langs:
+                entry["outputs"][l] = out
         elif not LANG_SLOT.search(out):
             n = f"all {len(langs)}" if langs else "every"
             errors.append(f"files[{i}].output '{out}' has no {{{{lang}}}} slot: {n} target languages would be written to that one file and overwrite each other. Put {{{{lang}}}} (or {{{{locale}}}} or {{{{language}}}}) where the language code goes")
@@ -6209,7 +6668,7 @@ def config_validate(root, path):
                 rx = "^" + LANG_SLOT.sub("([^/]+)", re.escape(out).replace(r"\{\{", "{{").replace(r"\}\}", "}}")) + "$"
                 targets = sorted({m.group(1) for f in all_files for m in [re.match(rx, f)] if m and is_lang(m.group(1)) and m.group(1) != src})
             for l in targets:
-                entry["outputs"][l] = LANG_SLOT.sub(lambda _m, code=locale_map.get(l, l): code, out)
+                entry["outputs"][l] = LANG_SLOT.sub(lambda _m, code=entry_map.get(l, l): code, out)
         report.append(entry)
     seen = {}
     for i, e in enumerate(cfg["files"], 1):
@@ -7275,7 +7734,36 @@ AUDIT_RULES = [
      "use a t() key with one/other (count:) so each language gets its plural rules"),
     ("rails", "strftime_literal", "locale_format", {".erb", ".haml", ".slim"}, re.compile(r"\.strftime\(\s*['\"]"),
      "use l(date, format: :short) with formats in the locale files"),
+    # Row 7619: iOS (Swift, Objective-C). A SwiftUI literal is a LocalizedStringKey: it is translated when the source
+    # .strings / .xcstrings holds it as a key (audit_line_findings drops those), shown as it is otherwise.
+    ("ios", "swiftui_text_literal", "hardcoded_string", {".swift"},
+     re.compile(r'(?:\b(?:Text|Button|Label|Toggle|Section|TextField)\(|\.(?:navigationTitle|alert|confirmationDialog)\()\s*"(?P<t>(?:[^"\\]|\\.)*)"'),
+     "make the literal a key of the source Localizable.strings (or String Catalog) with its text there"),
+    ("ios", "uikit_text_assign", "hardcoded_string", {".swift", ".m", ".mm"},
+     re.compile(r'\.(?:text|title|placeholder|prompt|message)\s*=\s*@?"(?P<t>(?:[^"\\]|\\.)*)"'),
+     'assign NSLocalizedString("key", comment: "...") instead of the literal'),
+    ("ios", "uikit_title_arg", "hardcoded_string", {".swift", ".m", ".mm"},
+     re.compile(r'(?:\b(?:UIAlertController|UIAlertAction|UIBarButtonItem)\([^"()]*?\b(?:title|message):\s*|\bsetTitle\(\s*|'
+                r'\b(?:alertControllerWithTitle|actionWithTitle|initWithTitle):\s*)@?"(?P<t>(?:[^"\\]|\\.)*)"'),
+     'pass NSLocalizedString("key", comment: "...") as the title or message'),
+    ("ios", "localized_concat", "concatenation", {".swift"},
+     re.compile(r'(?:\bNSLocalizedString\(|\bString\(localized:)[^()]*\)\s*\+|\+\s*(?:NSLocalizedString\(|String\(localized:)'),
+     'one key with a placeholder: String(format: NSLocalizedString("items.count %@", comment: ""), name)'),
+    ("ios", "interpolated_key", "concatenation", {".swift"},
+     re.compile(r'\bNSLocalizedString\(\s*"[^"]*\\\('),
+     "an interpolated NSLocalizedString key is looked up as the finished text, never found: use a format key with %@"),
+    ("ios", "objc_localized_append", "concatenation", {".m", ".mm"},
+     re.compile(r'NSLocalizedString\([^()]*\)\s*stringByAppendingString|stringByAppendingString:\s*NSLocalizedString'),
+     'one key with a placeholder: [NSString stringWithFormat:NSLocalizedString(@"key %@", nil), x]'),
+    ("ios", "key_not_in_strings", "i18n_call_misuse", {".swift", ".m", ".mm"},
+     re.compile(r'(?:\bNSLocalizedString\(|\bString\(localized:)\s*@?"(?P<k>[^"\\]*)"'),
+     "add the key to the source Localizable.strings (or String Catalog): a missing key shows the key itself"),
+    ("ios", "swift_plural_ternary", "plural", {".swift", ".m", ".mm"}, re.compile(r'==\s*1\s*\)?\s*\?\s*@?"'),
+     "use a .stringsdict / String Catalog plural variation: other languages have other plural rules"),
+    ("ios", "fixed_date_format", "locale_format", {".swift", ".m", ".mm"}, re.compile(r'\.dateFormat\s*=\s*@?"'),
+     "use dateStyle / setLocalizedDateFormatFromTemplate (or .formatted()) for the user's locale"),
 ]
+IOS_AUDIT_EXT = {".swift", ".m", ".mm"}
 GETTEXT_CALL_RE = re.compile(r"\b" + WP_GETTEXT + r"\(")
 STRING_LITERAL_RE = re.compile(r"""'(?:[^'\\]|\\.)*'|"(?:[^"\\]|\\.)*\"""")
 
@@ -7328,10 +7816,13 @@ def audit_frameworks(root, files, census):
         out.append("js")
     if "rails-i18n" in fw or "Gemfile" in names and re.search(r"gem ['\"]rails['\"]", open(os.path.join(root, "Gemfile"), encoding="utf-8", errors="replace").read()):
         out.append("rails")
+    # Row 7619: an iOS census (.strings / .xcstrings / .stringsdict in the tree) selects the iOS recipe.
+    if "ios-strings" in fw or exts & {".strings", ".xcstrings", ".stringsdict"}:
+        out.append("ios")
     return out
 
 
-def audit_line_findings(framework, path, no, line, gettext_spans=None):
+def audit_line_findings(framework, path, no, line, gettext_spans=None, keys=None):
     res = []
     if COMMENT_LINE_RE.match(line):
         return res
@@ -7343,6 +7834,10 @@ def audit_line_findings(framework, path, no, line, gettext_spans=None):
             continue
         for m in rx.finditer(line):
             text = (m.groupdict().get("t") or "").strip()
+            if rule == "key_not_in_strings" and (not keys or m.group("k") in keys or "\\(" in m.group("k")):
+                continue  # row 7619: only with the source keys read; an interpolated key is interpolated_key's finding
+            if rule == "swiftui_text_literal" and keys and m.group("t") in keys:
+                continue  # a key of the source .strings: translated
             if cls == "hardcoded_string":
                 if not PROSE_RE.search(text) and not re.fullmatch(r"[A-Z][a-z]{2,}", text):
                     continue
@@ -7368,10 +7863,11 @@ def audit_strings(root, with_runtime):
     census = scan(root, "en", [])
     files = list_files(root)
     frameworks = audit_frameworks(root, files, census)
+    ios_keys = {k for keys in ios_source_keys(root, files).values() for k in keys} if "ios" in frameworks else set()
     findings, scanned, skipped = [], 0, 0
     for f in files:
         ext = os.path.splitext(f)[1].lower()
-        if ext not in CODE_EXT | {".jsx", ".tsx", ".erb"}:
+        if ext not in CODE_EXT | {".jsx", ".tsx", ".erb"} | (IOS_AUDIT_EXT if "ios" in frameworks else set()):
             continue
         if AUDIT_MINIFIED_RE.search(f) or NON_PRODUCT.search(f):
             skipped += 1
@@ -7395,7 +7891,7 @@ def audit_strings(root, with_runtime):
                     open_lines = open_lines + 1 if depth else 0
                     if open_lines > 20:
                         depth, open_lines = 0, 0
-                findings += audit_line_findings(fw, f, no, line, spans)
+                findings += audit_line_findings(fw, f, no, line, spans, ios_keys)
     counts = {}
     for x in findings:
         counts[x["class"]] = counts.get(x["class"], 0) + 1
@@ -7838,7 +8334,17 @@ def output_regex(out_pat):
                       .replace(r"\*\*/", "(?:.*/)?").replace(r"\*", "[^/]*") + "$")
 
 
-def ordered_lang(tag, cfg):
+def config_locale_map(raw):
+    """A parsed locale_map: config_validate's dict, or the raw `{code: locale, ...}` text read_config keeps."""
+    if isinstance(raw, dict):
+        return raw
+    if not isinstance(raw, str) or not raw.strip().startswith("{"):
+        return {}
+    pairs = [x.partition(":") for x in raw.strip()[1:-1].split(",") if x.strip()]
+    return {unquote(c.strip()): unquote(v.strip()) for c, _, v in pairs if c.strip() and v.strip()}
+
+
+def ordered_lang(tag, cfg, entry=None):
     """GAP-G32 (WPML lab run 7: "195 of 209 delivered files are PTC deliveries", the 14 others shipped translations of
     languages never ordered): a file is a delivery only for a configured language. Its {{lang}} tag must be the language's
     file locale (locale_map), or, for a language without a locale_map entry, the language itself or a regional tag of it
@@ -7848,8 +8354,8 @@ def ordered_lang(tag, cfg):
         langs = [x.strip() for x in langs.split(",") if x.strip()]
     if not langs:
         return True
-    lmap = (cfg or {}).get("locale_map")
-    lmap = lmap if isinstance(lmap, dict) else {}
+    # row #7648: the entry's own map, else the config-wide one
+    lmap = config_locale_map((entry or {}).get("locale_map")) or config_locale_map((cfg or {}).get("locale_map"))
     norm = lambda c: str(c).strip().lower().replace("_", "-")
     t = norm(tag)
     for lang in langs:
@@ -7874,7 +8380,7 @@ def delivered_files_sha(root, cfg):
         srcs = {f for f in files if fnmatch_path(f, e["file"])}
         for f in files:
             m = rx.match(f)
-            if m and f not in srcs and is_lang(m.group("lang")) and ordered_lang(m.group("lang"), cfg) and f not in found:
+            if m and f not in srcs and is_lang(m.group("lang")) and ordered_lang(m.group("lang"), cfg, e) and f not in found:
                 found.append(f)
     out = {}
     for f in sorted(found)[:DELIVERED_FILES_MAX]:
@@ -7906,7 +8412,7 @@ def delivered_files_sha_at(root, cfg, rev):
         rx = output_regex(e["output"])
         for f in files:
             m = rx.match(f)
-            if m and not fnmatch_path(f, e["file"]) and is_lang(m.group("lang")) and ordered_lang(m.group("lang"), cfg) and f not in found:
+            if m and not fnmatch_path(f, e["file"]) and is_lang(m.group("lang")) and ordered_lang(m.group("lang"), cfg, e) and f not in found:
                 found.append(f)
     out = {}
     for f in sorted(found)[:DELIVERED_FILES_MAX]:
@@ -8071,14 +8577,16 @@ def action_body(scan_path, cfg_path, project_id, sha, branch, root, limit, chang
     prefix = git(root, "rev-parse", "--show-prefix").strip()
     sources = set()
     batches, current, total = [], {}, 0
-    for s in scan_doc.get("resource_sets", []):
+    # Row 7619: plus the iOS sources (.strings / .xcstrings) the scan keys its usages by (their sets are PTC's own).
+    ios_sources = [{"path": u} for u in (scan_doc.get("usages") or {}) if u.endswith(IOS_SOURCE_EXT)]
+    for s in scan_doc.get("resource_sets", []) + [{"source_files": ios_sources}]:
         for sf in s.get("source_files", []):
             sources.add(prefix + sf["path"])
             if sf["path"] in current or any(sf["path"] in b for b in batches):
                 continue
             p = os.path.join(root, sf["path"])
             try:
-                data = open(p, encoding="utf-8", errors="replace").read()
+                data = ios_read_text(p) if sf["path"].endswith(IOS_SOURCE_EXT) else open(p, encoding="utf-8", errors="replace").read()
             except OSError:
                 continue
             size = len(data.encode("utf-8"))
@@ -8219,6 +8727,16 @@ def project_answer(path, local=False):
                              "guide.\n" % (d["project_id"], ci))
         print(d["project_id"])
         return 0
+    ask = d.get("ask_human")
+    if isinstance(ask, dict) and ask.get("question"):
+        # Org row 7583 (T1, L15 ruling 1): a PTC project already connects this repository; nothing was created.
+        out = ["PTC asks: %s" % ask["question"]]
+        for r in d.get("replies") or []:
+            if isinstance(r, dict) and r.get("cli"):
+                out.append("  %s: %s" % (r.get("option") or "", r["cli"]))
+        out.append("Ask the human which one, then run that command. Nothing was created; no guide session is open.")
+        sys.stderr.write("\n".join(out) + "\n")
+        return 3
     orgs = d.get("organizations")
     if isinstance(orgs, list) and orgs:
         out = ["PTC asks %s the project belongs to: your agent token acts in %d organizations." % (d.get("ask") or "which organization", len(orgs))]
@@ -8532,14 +9050,12 @@ _ptc_py() {
 _ptc_config_pairs() {  # prints "file<TAB>output" per files: entry
     local cfg="$1"
     [[ -f "$cfg" ]] || return 0
-    local files outputs
-    files=$(grep -A999 '^files:' "$cfg" | grep '^ *- file:' | sed 's/^ *- file: *//; s/ *$//')
-    outputs=$(grep -A999 '^files:' "$cfg" | grep '^ *output:' | sed 's/^ *output: *//; s/ *$//')
-    paste <(printf '%s\n' "$files") <(printf '%s\n' "$outputs") | grep -v '^\s*$' || true
+    # Org #7606: config_entries reads each value as YAML does (a quoted `"{{lang}}.json"` is `{{lang}}.json`), per entry.
+    config_entries "$cfg" | grep -v '^\s*$' || true
 }
 
 cmd_scan() {
-    local root="$PTC_PROJECT_DIR" json=false cfg="" src=""
+    local root="$PTC_PROJECT_DIR" json=false cfg="" src="" declared=""
     while [[ $# -gt 0 ]]; do
         case $1 in
             --json) json=true; shift ;;
@@ -8553,6 +9069,9 @@ cmd_scan() {
     [[ -z "$cfg" && -f "$root/.ptc-config.yml" ]] && cfg="$root/.ptc-config.yml"
     if [[ -n "$cfg" && -z "$src" ]]; then
         src=$(grep '^source_locale:' "$cfg" 2>/dev/null | sed 's/^source_locale: *//; s/ *$//' | tr -d "\"'" || true)
+        [[ -n "$src" ]] && declared=config
+    elif [[ -n "$src" ]]; then
+        declared=flag
     fi
     local pairs=()
     if [[ -n "$cfg" ]]; then
@@ -8560,7 +9079,8 @@ cmd_scan() {
         while IFS= read -r line; do [[ -n "$line" ]] && pairs+=("$line"); done < <(_ptc_config_pairs "$cfg")
     fi
     local out
-    out=$(_ptc_py scan "$root" "${src:-en}" "${pairs[@]+"${pairs[@]}"}") || return 1
+    # #6628: the census can tell a declared source locale (config / -s) from the en default only by this.
+    out=$(PTC_SCAN_SOURCE_DECLARED="$declared" _ptc_py scan "$root" "${src:-en}" "${pairs[@]+"${pairs[@]}"}") || return 1
     if [[ "$json" == "true" ]]; then
         printf '%s\n' "$out"
     else
@@ -8568,6 +9088,8 @@ cmd_scan() {
 import json,sys
 d=json.load(sys.stdin)
 print("frameworks: "+", ".join(d["frameworks"]))
+sl=d["source_locale"]
+print("source locale: %s (%s)"%(sl["code"],{"config":"declared in the config","flag":"given with -s"}.get(sl["declared"],"not declared: the en default")))
 for s in d["resource_sets"]:
     n=sum(f["count"] for f in s["source_files"])
     print("  %-5s %s  (%d entries; languages: %s)"%(s["format"],s["source_pattern"],n,", ".join(s["existing_languages"]) or "none"))
@@ -8655,8 +9177,16 @@ cmd_lint() {
 # S2-R2 item 2 (decision 5; specs/agent-guide AGD-3): a LOCAL quote. Words by PTC's rule over the whole configured
 # census x target languages x the per-word credit rate. The rate and the balance are the only remote inputs: one GET
 # balance (word_cost, balance_words), skipped when --rate and --balance are given (the guide's estimate task carries them).
+# Org #7608: the project `ptc estimate` names for an agent token: --project-id, PTC_GUIDE_PROJECT_ID, the config's
+# guide.project_id, then the guide session cache of the estimated directory (.ptc/session.json); no PTC lookup. Prints it.
+_estimate_project_id() {
+    local flag="$1" cfg="$2" root="$3"
+    PTC_PROJECT_DIR="$root" _guide_project_id "$flag" "$cfg" nolookup >/dev/null 2>&1 || true
+    printf '%s' "${PTC_GUIDE_PROJECT_ID:-}"
+}
+
 cmd_estimate() {
-    local fmt=text root="$PTC_PROJECT_DIR" cfg="" langs="" rate="" balance="" cases="" offline=false files=() excludes=""
+    local fmt=text root="$PTC_PROJECT_DIR" cfg="" langs="" rate="" balance="" cases="" offline=false files=() excludes="" project_flag=""
     while [[ $# -gt 0 ]]; do
         case $1 in
             --json) fmt=json; shift ;;
@@ -8669,10 +9199,13 @@ cmd_estimate() {
             --covered) balance=covered; shift ;;
             --api-url) PTC_API_URL="$2"; shift 2 ;;
             --file) files+=("$2"); shift 2 ;;
+            --project-id) project_flag="$2"; shift 2 ;;
             --exclude) excludes+="$2"$'\n'; shift 2 ;;
             --check-cases) cases="$2"; shift 2 ;;
             -h|--help)
-                echo "Usage: $SCRIPT_NAME estimate [--json] [--offline] [-d DIR] [-c CONFIG] [--languages de,fr] [--rate CREDITS_PER_WORD] [--balance WORDS | --covered] [--file PATH]... [--exclude PATH]..."
+                echo "Usage: $SCRIPT_NAME estimate [--json] [--offline] [-d DIR] [-c CONFIG] [--languages de,fr] [--rate CREDITS_PER_WORD] [--balance WORDS | --covered] [--file PATH]... [--exclude PATH]... [--project-id N]"
+                echo "  --project-id N  the PTC project an agent token (PTC_AGENT_TOKEN) quotes for; default: PTC_GUIDE_PROJECT_ID, the"
+                echo "                  config's guide.project_id, then the guide session in .ptc/session.json."
                 echo "  --covered  the subscription covers the run (PTC's estimate task says so): no word balance, no shortfall."
                 echo "  --exclude PATH  leave a configured file out (repeatable); with --languages it quotes a narrowed scope."
                 echo "  Quote: words by PTC's rule over the configured source files x languages x rate. PO/POT, YAML and JSON are"
@@ -8697,9 +9230,7 @@ cmd_estimate() {
             return 1
         fi
         local hdr=() pid=""
-        if [[ -n "$cfg" ]]; then
-            pid=$(grep -E '^[[:space:]]+project_id:' "$cfg" 2>/dev/null | head -n1 | sed -E 's/.*project_id:[[:space:]]*//; s/[[:space:]]*$//') || true
-        fi
+        pid=$(_estimate_project_id "$project_flag" "$cfg" "$root")
         if [[ -n "${PTC_ORG_TOKEN:-}" && -z "${PTC_API_TOKEN:-}" && -n "$pid" ]]; then
             hdr=(-H "X-PTC-Project-Id: $pid")
         fi
@@ -8727,9 +9258,12 @@ print(d.get("word_cost") if d.get("word_cost") is not None else "", "" if b is N
         uncounted=$(_ptc_py estimate "$root" unquoted "$cfg" "$langs" "$rate" "$balance" ${files[@]+"${files[@]}"} 2>/dev/null) || uncounted=""
         if [[ -n "$uncounted" && -z "$token" ]]; then
             log_warning "ptc estimate: set PTC_API_TOKEN (or PTC_AGENT_TOKEN) to have PTC count the files no local reader covers"
+        elif [[ -n "$uncounted" && -n "${PTC_ORG_TOKEN:-}" && -z "${PTC_API_TOKEN:-}" && -z "$(_estimate_project_id "$project_flag" "$cfg" "$root")" ]]; then
+            # Org #7608: an agent token counts only for a named project; PTC would answer 401 for every file.
+            log_warning "ptc estimate: PTC counts $(printf '%s\n' "$uncounted" | grep -c .) file(s) no local reader covers (.strings, XML, PHP, ...) only for a named project, and none is named: pass --project-id N (the guide session's project), set PTC_GUIDE_PROJECT_ID, or give -c a config with guide.project_id. They are listed as not counted."
         elif [[ -n "$uncounted" ]]; then
             local pid="" ehdr=() path code hdrs try body_file
-            [[ -n "$cfg" ]] && pid=$(grep -E '^[[:space:]]+project_id:' "$cfg" 2>/dev/null | head -n1 | sed -E 's/.*project_id:[[:space:]]*//; s/[[:space:]]*$//') || true
+            pid=$(_estimate_project_id "$project_flag" "$cfg" "$root")
             [[ -n "${PTC_ORG_TOKEN:-}" && -z "${PTC_API_TOKEN:-}" && -n "$pid" ]] && ehdr=(-H "X-PTC-Project-Id: $pid")
             remote=$(mktemp); hdrs=$(mktemp); body_file=$(mktemp)
             while IFS= read -r path; do
@@ -8746,6 +9280,8 @@ print(d.get("word_cost") if d.get("word_cost") is not None else "", "" if b is N
                 done
                 if [[ "$code" == 200 ]]; then
                     printf '%s\t%s\n' "$path" "$(tr -d '\n' < "$body_file")" >> "$remote"
+                elif [[ "$code" == 401 || "$code" == 403 ]]; then
+                    log_warning "ptc estimate: PTC did not count $path for this token${pid:+ and project $pid} (PTC says: $(_ptc_py field "$body_file" message 2>/dev/null | head -c 200)); check the token and --project-id. It is listed as not counted"
                 else
                     log_warning "ptc estimate: PTC's dry-run estimate for $path answered HTTP $code; it is listed as not counted"
                 fi
@@ -8764,7 +9300,8 @@ cmd_audit() {
     if [[ "$sub" != "strings" ]]; then
         echo "Usage: $SCRIPT_NAME audit strings [--json] [--runtime] [-d DIR]"
         echo "  string audit: user-visible text outside the i18n calls, concatenated fragments, plurals and"
-        echo "  locale formats outside the i18n API (WordPress/PHP, JS/React, Rails recipes by the census framework)."
+        echo "  locale formats outside the i18n API (WordPress/PHP, JS/React, Rails, iOS Swift/Objective-C recipes by the"
+        echo "  census framework)."
         echo "  --runtime adds the runtime loading audit (script handle / text domain vs catalogue names, stale .mo/.json)."
         echo "  Exit 0 (findings or not), 2 no recognised framework, 1 error."
         [[ "$sub" == "-h" || "$sub" == "--help" ]] && return 0
@@ -9261,7 +9798,7 @@ _guide_check() {
         _guide_check_refusal "$fmt" "no_token" "PTC_API_TOKEN and PTC_AGENT_TOKEN are not set (the agent token; PTC_ORG_TOKEN is still accepted). $(api_token_doors)"
         return 2
     fi
-    [[ -z "$sha" ]] && sha="${CI_COMMIT_SHA:-${GITHUB_SHA:-}}"
+    [[ -z "$sha" ]] && sha="${CI_COMMIT_SHA:-${GITHUB_SHA:-${BITBUCKET_COMMIT:-}}}"
     [[ -z "$sha" ]] && sha=$(git -C "$PTC_PROJECT_DIR" rev-parse HEAD 2>/dev/null || true)
     sid="${PTC_GUIDE_SESSION_ID:-}"
     [[ -z "$cfg" && -f "$PTC_PROJECT_DIR/.ptc-config.yml" ]] && cfg="$PTC_PROJECT_DIR/.ptc-config.yml"
@@ -9316,11 +9853,19 @@ PY
 # line on stdout, escaped for a push option: a value cannot hold a literal newline, and GitLab turns every `\n` into one
 # (a plain gsub, no other unescaping), so a backslash-n already in the text gets a zero-width space after its backslash
 # and newlines become `\n`. The fetch line names the branch PTC's check names (`comment.branch`, GAP-G52). The CI-time limit note (PTC_LIMIT_NOTE_FILE, CI-16) leads the text when the run wrote one.
+# Row #7645 (lab runs p3/p4: a retried job's merge request said the earlier attempt "stopped ... and delivered nothing"):
+# the check runs at job start, before this run translates, so its `comment.stop_notice` is the stop of an EARLIER
+# attempt. With --written-manifest (the push step: the files this run wrote, NUL-separated) the description says what
+# THIS delivery contains (the files, and the languages of its delivered shas: "<manifest>.delivered", else the run
+# state) and leaves that sentence out;
+# without one (the job-start log line), or with an empty one, PTC's text is kept.
 # Capped at PTC_MR_DESCRIPTION_MAX bytes. The findings also go to stderr, so every job log
 # carries them, including runs that push nothing. Never fails: a missing or unreadable file gives the neutral text.
 _guide_mr_description() {
-    local json="$1"
-    python3 - "$json" <<'PY' || echo "Translations delivered by PTC."
+    local json="$1" manifest="${2:-}" state=""
+    if [[ -n "$manifest" && -f "$manifest.delivered" ]]; then state="$manifest.delivered"
+    elif [[ -n "$manifest" ]]; then state="$(ptc_run_state_file 2>/dev/null)"; fi
+    python3 - "$json" "$manifest" "$state" <<'PY' || echo "Translations delivered by PTC."
 import json, os, sys
 NEUTRAL = ("Translations delivered by PTC. PTC updates this merge request when a CI run changes a translation. "
            "The translations reach your base branch when this merge request is merged, by you or by auto-merge.")
@@ -9331,6 +9876,42 @@ except Exception:
     d = {}
 c = d.get("comment") or {}
 body = c.get("body") or ""
+manifest, state = (sys.argv[2:4] + ["", ""])[:2]
+def written_paths(path):
+    try:
+        raw = open(path, "rb").read().decode("utf-8", "replace")
+    except Exception:
+        return []
+    out = []
+    for entry in raw.split("\0"):
+        entry = entry.strip("\n")
+        entry = entry[len(":(literal)"):] if entry.startswith(":(literal)") else entry
+        if entry and entry not in out:
+            out.append(entry)
+    return out
+written = written_paths(manifest) if manifest else []
+# Row #7645: the languages of the files this run wrote, from the run state ("shas<TAB>file<TAB><iso>=<sha>,...", the
+# download's X-PTC-Delivered-Shas; "outs<TAB>file<TAB>sha<TAB>path..." the outputs it wrote for that file).
+languages = set()
+if written and state:
+    try:
+        rows = [l.split("\t") for l in open(state, encoding="utf-8", errors="replace").read().splitlines()]
+    except Exception:
+        rows = []
+    outs = {r[1]: r[3::2] for r in rows if r[0] == "outs" and len(r) > 1}
+    shas = {r[1]: [kv.split("=", 1)[0] for kv in r[2].split(",") if "=" in kv] for r in rows if r[0] == "shas" and len(r) > 2}
+    mine = lambda p: any(p == w or p.endswith("/" + w) for w in written)
+    for src, paths in outs.items():
+        if any(mine(p) for p in paths):
+            languages.update(iso for iso in shas.get(src, []) if iso)
+delivery = ""
+if written:
+    listed = ", ".join(written[:10]) + (" and %d more" % (len(written) - 10) if len(written) > 10 else "")
+    langs = " in %d language(s) (%s)" % (len(languages), ", ".join(sorted(languages))) if languages else ""
+    delivery = "**This delivery.** This CI run delivered %d translation file(s)%s: %s." % (len(written), langs, listed)
+    stop = c.get("stop_notice") or ""
+    if stop:
+        body = body.replace("\n\n" + stop, "").replace(stop, "").rstrip()
 # GAP-G52: the branch the job pushes, as PTC names it for the session (`comment.branch`: per product in a suite);
 # PTC_MR_BRANCH overrides it, and an older PTC that sends none gets ptc/translations.
 branch = os.environ.get("PTC_MR_BRANCH") or c.get("branch") or "ptc/translations"
@@ -9357,6 +9938,8 @@ except Exception:
 # paragraph is not repeated.
 if note and "PTC's delivery is not complete" in body:
     note = "\n\n".join(p for p in note.split("\n\n") if not p.startswith("**PTC's delivery is not complete.**")).strip()
+if delivery:
+    text = delivery + "\n\n" + text
 if note:
     text = note + "\n\n" + text
 esc = lambda s: s.replace("\r", "").replace("\\n", "\\\u200bn").replace("\n", "\\n")
@@ -9392,6 +9975,8 @@ A project begun in the PTC wizard continues with your agent by its id: \`ptc gui
                                                           (PTC then lists them: ask the human which one)
                                                           --repo-url must be one of the checkout's remotes (default: origin);
                                                           no remote: a local project, delivery by ptc sync (never guess a URL)
+         [--new-project]                                  when PTC asks (a PTC project already connects this repository)
+                                                          and the human chose to set up a new project
   next                                                    the next task
   submit TASK_ID [--file evidence.json]                   submit evidence (stdin when no --file)
   skip   TASK_ID --reason TEXT                            skip a task (a human decision)
@@ -9427,7 +10012,7 @@ A project begun in the PTC wizard continues with your agent by its id: \`ptc gui
                                                           Prints the run_key the guide's tasks ask for. Every file a guide
                                                           task named (and each --file) rides with its sha256 and content
                                                           and counts in the workspace fingerprint (SF-22: proof without git)
-  mr-description --file CHECK.json                        GitLab CI: print the translations merge request's description as
+  mr-description --file CHECK.json [--written-manifest F] GitLab CI: print the translations merge request's description as
                                                           ONE push-option line (PTC's findings, or a neutral text when the
                                                           project setting is off); the findings also go to stderr (the job
                                                           log). The recipe pushes it with -o merge_request.description.
@@ -9605,17 +10190,19 @@ cmd_guide() {
     if [[ "$sub" == "delivery-commit" ]]; then
         cmd_guide_delivery_commit "$@"; return $?
     fi
-    local json=false task_id="" file="" reason="" project_id="" organization_id="" repo_url="" branch="" wait_timeout="20m" commit_sha="" cfg=""
+    local json=false task_id="" file="" reason="" project_id="" organization_id="" repo_url="" branch="" wait_timeout="20m" commit_sha="" cfg="" new_project="" written=""
     while [[ $# -gt 0 ]]; do
         case $1 in
             --json) json=true; shift ;;
             --file) file="$2"; shift 2 ;;
+            --written-manifest) written="$2"; shift 2 ;;  # mr-description (row #7645): the files this run wrote
             --validate-file) shift 2 ;;  # S2-R14: an older recipe's validate file is ignored
             --reason) reason="$2"; shift 2 ;;
             --session-id) PTC_GUIDE_SESSION_ID="$2"; shift 2 ;;
             --project-id) project_id="$2"; shift 2 ;;
             -v|--verbose) PTC_VERBOSE=true; shift ;;
             --organization-id) organization_id="$2"; shift 2 ;;
+            --new-project) new_project=1; shift ;;
             --repo-url) repo_url="$2"; shift 2 ;;
             --branch) branch="$2"; shift 2 ;;
             --timeout) wait_timeout="$2"; shift 2 ;;
@@ -9624,7 +10211,11 @@ cmd_guide() {
             --api-url) PTC_API_URL="$2"; shift 2 ;;
             -d|--project-dir) PTC_PROJECT_DIR="$2"; shift 2 ;;
             -h|--help) show_guide_help; return 0 ;;
-            -*) log_error "Unknown option: $1"; return 1 ;;
+            -*)
+                if [[ "$sub" =~ ^(mr-description|check)$ ]] && ptc_unknown_option "guide $sub" "$@"; then
+                    shift "$PTC_UNKNOWN_SHIFT"; continue
+                fi
+                log_error "Unknown option: $1"; return 1 ;;
             *) task_id="$1"; shift ;;
         esac
     done
@@ -9674,10 +10265,12 @@ cmd_guide() {
                 # No project yet: create it in the organization. The CI secret is the organization agent token (ruling b).
                 local pbody; pbody=$(ptc_mktemp)
                 NAME="$(basename "$(git -C "$PTC_PROJECT_DIR" rev-parse --show-toplevel 2>/dev/null || (cd "$PTC_PROJECT_DIR" && pwd))")" URL="$repo_url" BR="$branch" \
-                    ORG="$organization_id" SID="$known_sid" PID="$known_pid" FP="$local_fp" python3 -c 'import json,os;d={"name":os.environ["NAME"],"repo_url":os.environ["URL"],"default_branch":os.environ["BR"]};d.update({"local":1,"fingerprint":os.environ["FP"]} if not os.environ["URL"] else {});o=os.environ["ORG"];d.update({"organization_id":int(o) if o.isdigit() else o} if o else {});n=lambda v:int(v) if v.isdigit() else v;d.update({"session_id":n(os.environ["SID"])} if os.environ["SID"] else {});d.update({"project_id":n(os.environ["PID"])} if os.environ["PID"] else {});print(json.dumps(d))' > "$pbody"
+                    ORG="$organization_id" SID="$known_sid" PID="$known_pid" FP="$local_fp" NEWP="$new_project" python3 -c 'import json,os;d={"name":os.environ["NAME"],"repo_url":os.environ["URL"],"default_branch":os.environ["BR"]};d.update({"new_project":True} if os.environ["NEWP"] else {});d.update({"local":1,"fingerprint":os.environ["FP"]} if not os.environ["URL"] else {});o=os.environ["ORG"];d.update({"organization_id":int(o) if o.isdigit() else o} if o else {});n=lambda v:int(v) if v.isdigit() else v;d.update({"session_id":n(os.environ["SID"])} if os.environ["SID"] else {});d.update({"project_id":n(os.environ["PID"])} if os.environ["PID"] else {});print(json.dumps(d))' > "$pbody"
                 _guide_call POST projects "$pbody" || return 1
                 # SF-18 (L8): a token acting in several organizations gets PTC's "which organization" answer (no project_id);
-                # it is printed as a list with the --organization-id remedy, never a traceback.
+                # it is printed as a list with the --organization-id remedy, never a traceback. Org row 7583: PTC's
+                # existing-project ask (a PTC project already connects the repository) is printed with the two reply
+                # commands; no session is opened.
                 project_id=$(_ptc_py project-answer "$GUIDE_RESPONSE" "$([[ -z "$repo_url" ]] && echo local || echo repo)") || return 1
             fi
             _ptc_py body "$(PID="$project_id" URL="$repo_url" BR="$branch" FP="$local_fp" python3 -c 'import json,os;d={"project_id":int(os.environ["PID"]) if os.environ["PID"].isdigit() else os.environ["PID"],"repo_url":os.environ["URL"],"branch":os.environ["BR"]};d.update({"local":1,"fingerprint":os.environ["FP"]} if not os.environ["URL"] else {});print(json.dumps(d))')" > "$body"
@@ -9746,7 +10339,7 @@ PY
             _guide_upload_sources "$task_id" "$fmt" "$cfg"; return $?
             ;;
         mr-description)
-            _guide_mr_description "$file"; return $?
+            _guide_mr_description "$file" "$written"; return $?
             ;;
         ""|-h|--help|help) show_guide_help; return 0 ;;
         *) log_error "Unknown guide command: $sub"; show_guide_help; return 1 ;;
@@ -9762,16 +10355,18 @@ PY
 #   explicit / lab : PTC_CI_ID_TOKEN (the lab CI hook mints it, HS256)
 #   GitLab         : PTC_ID_TOKEN    (job keyword  id_tokens: { PTC_ID_TOKEN: { aud: ptc } })
 #   GitHub Actions : requested from ACTIONS_ID_TOKEN_REQUEST_URL (workflow needs  permissions: id-token: write)
+#   Bitbucket      : BITBUCKET_STEP_OIDC_TOKEN (step keyword  oidc: { audiences: [ptc] })
 # L3-1 (POL-116): this run is a CI run when CI says so: an identity token (the variables _guide_ci_id_token reads), or the
-# commit / CI markers GitHub Actions and GitLab set (the ones the action-run already reads for the commit). Anything else is
+# commit / CI markers GitHub Actions, GitLab and Bitbucket Pipelines set (the ones the action-run already reads for the commit). Anything else is
 # the agent's own machine: the run asks for provenance agent_local.
 _guide_in_ci() {
-    [[ -n "${PTC_CI_ID_TOKEN:-}${PTC_ID_TOKEN:-}${ACTIONS_ID_TOKEN_REQUEST_URL:-}${GITHUB_ACTIONS:-}${GITLAB_CI:-}${GITHUB_SHA:-}${CI_COMMIT_SHA:-}" ]]
+    [[ -n "${PTC_CI_ID_TOKEN:-}${PTC_ID_TOKEN:-}${ACTIONS_ID_TOKEN_REQUEST_URL:-}${GITHUB_ACTIONS:-}${GITLAB_CI:-}${GITHUB_SHA:-}${CI_COMMIT_SHA:-}${BITBUCKET_STEP_OIDC_TOKEN:-}${BITBUCKET_COMMIT:-}" ]]
 }
 
 _guide_ci_id_token() {
     if [[ -n "${PTC_CI_ID_TOKEN:-}" ]]; then printf '%s' "$PTC_CI_ID_TOKEN"; return 0; fi
     if [[ -n "${PTC_ID_TOKEN:-}" ]]; then printf '%s' "$PTC_ID_TOKEN"; return 0; fi
+    if [[ -n "${BITBUCKET_STEP_OIDC_TOKEN:-}" ]]; then printf '%s' "$BITBUCKET_STEP_OIDC_TOKEN"; return 0; fi
     if [[ -n "${ACTIONS_ID_TOKEN_REQUEST_URL:-}" && -n "${ACTIONS_ID_TOKEN_REQUEST_TOKEN:-}" ]]; then
         local resp sep="?"
         [[ "$ACTIONS_ID_TOKEN_REQUEST_URL" == *\?* ]] && sep="&"
@@ -9875,8 +10470,8 @@ cmd_guide_action_run_impl() {
     else
         echo '{"config":null}' > "$cfgjson"
     fi
-    sha="${GITHUB_SHA:-${CI_COMMIT_SHA:-$(git -C "$PTC_PROJECT_DIR" rev-parse HEAD 2>/dev/null || true)}}"
-    branch="${GITHUB_REF_NAME:-${CI_COMMIT_REF_NAME:-$(git -C "$PTC_PROJECT_DIR" rev-parse --abbrev-ref HEAD 2>/dev/null || true)}}"
+    sha="${GITHUB_SHA:-${CI_COMMIT_SHA:-${BITBUCKET_COMMIT:-$(git -C "$PTC_PROJECT_DIR" rev-parse HEAD 2>/dev/null || true)}}}"
+    branch="${GITHUB_REF_NAME:-${CI_COMMIT_REF_NAME:-${BITBUCKET_BRANCH:-$(git -C "$PTC_PROJECT_DIR" rev-parse --abbrev-ref HEAD 2>/dev/null || true)}}}"
     # D13: the paths this commit changed against the default branch (merge base), for PTC's scope check.
     local changed; changed=$(ptc_mktemp)
     _guide_changed_files > "$changed" 2>/dev/null || : > "$changed"
@@ -9888,7 +10483,7 @@ cmd_guide_action_run_impl() {
         agent_local=1
         log_info "Not in CI: reporting this working tree as an agent-local run (workspace fingerprint + file digests)."
     elif [[ -z "$id_token" ]]; then
-        log_warning "No CI identity token: PTC records this run as unverified provenance. GitHub: add 'permissions: id-token: write' to the workflow; GitLab: add 'id_tokens: { PTC_ID_TOKEN: { aud: ptc } }' to the job."
+        log_warning "No CI identity token: PTC records this run as unverified provenance. GitHub: add 'permissions: id-token: write' to the workflow; GitLab: add 'id_tokens: { PTC_ID_TOKEN: { aud: ptc } }' to the job; Bitbucket: add 'oidc: { audiences: [ptc] }' to the step."
     fi
     # SF-22 (L8): the files guide tasks named (.ptc/session.json, recorded by guide next/submit) and each --file.
     local named; named="${PTC_ACTION_RUN_FILES:-}$(_ptc_py sess named-files "$(_guide_session_file)" 2>/dev/null || true)"
@@ -9967,10 +10562,14 @@ cmd_guide_action_run() {
             -v|--verbose) PTC_VERBOSE=true; shift ;;
             --api-url) PTC_API_URL="$2"; shift 2 ;;
             -d|--project-dir) PTC_PROJECT_DIR="$2"; shift 2 ;;
-            *) log_error "Unknown option: $1"; return 1 ;;
+            *)
+                if ptc_unknown_option "guide action-run" "$@"; then shift "$PTC_UNKNOWN_SHIFT"; continue; fi
+                log_error "Unknown option: $1"; return 1 ;;
         esac
     done
     [[ -z "$cfg" && -f "$PTC_PROJECT_DIR/.ptc-config.yml" ]] && cfg="$PTC_PROJECT_DIR/.ptc-config.yml"
+    # Org #7732 (AGD-8): the config's api_url like every other guide door (cmd_guide dispatches here before its own call).
+    _config_api_url_fallback "${cfg:-$PTC_PROJECT_DIR/.ptc-config.yml}"
     GUIDE_RUN_KEY=""
     cmd_guide_action_run_impl "$cfg" "$project_id" "$out" || return $?
     [[ -n "$GUIDE_RUN_KEY" ]] && printf 'run_key: %s\n' "$GUIDE_RUN_KEY"
@@ -10002,9 +10601,14 @@ cmd_guide_delivery_commit() {
             --project-id) project_id="$2"; shift 2 ;;
             --api-url) PTC_API_URL="$2"; shift 2 ;;
             -d|--project-dir) PTC_PROJECT_DIR="$2"; shift 2 ;;
-            *) log_error "Unknown option: $1"; return 1 ;;
+            *)
+                if ptc_unknown_option "guide delivery-commit" "$@"; then shift "$PTC_UNKNOWN_SHIFT"; continue; fi
+                log_error "Unknown option: $1"; return 1 ;;
         esac
     done
+    # Org #7732 (AGD-8; lab Bitbucket run 9 Nov 2026): the report goes to the config's api_url unless --api-url or
+    # PTC_API_URL names another; without this call it went to production (cmd_guide dispatches here before its own call).
+    _config_api_url_fallback "${cfg:-$PTC_PROJECT_DIR/.ptc-config.yml}"
     resolve_api_token
     local token="${PTC_API_TOKEN:-${PTC_ORG_TOKEN:-}}"
     [[ -z "$token" ]] && { log_error "No API token: PTC_API_TOKEN and PTC_AGENT_TOKEN are not set. $(api_token_doors)"; return 1; }
@@ -10013,7 +10617,7 @@ cmd_guide_delivery_commit() {
     fi
     [[ -z "$commit" && -z "$stopped" && -z "$fingerprint" ]] && { log_error "guide delivery-commit needs --commit SHA (the translations-branch commit), or --workspace-fingerprint FP (a report without a commit)"; return 1; }
     [[ -z "$cfg" && -f "$PTC_PROJECT_DIR/.ptc-config.yml" ]] && cfg="$PTC_PROJECT_DIR/.ptc-config.yml"
-    [[ -z "$source" ]] && source="${GITHUB_SHA:-${CI_COMMIT_SHA:-}}"
+    [[ -z "$source" ]] && source="${GITHUB_SHA:-${CI_COMMIT_SHA:-${BITBUCKET_COMMIT:-}}}"
     # Org #7188 (CLI-27): the one project resolver (flag, env, config, cache; a CI job asks PTC nothing more here).
     _guide_project_id "$project_id" "$cfg" nolookup && project_id="$PTC_GUIDE_PROJECT_ID"
     local cfgjson body resp code
@@ -10072,7 +10676,7 @@ except Exception:
 #   3. the full translate workflow (upload -> process -> monitor/download) writing the configured outputs;
 #   4. guide delivery-commit with NO branch and no commit: the workspace fingerprint + the sha256 of exactly the files step 3
 #      wrote. --dry-run reports the run and the plan (step 3 dry) and moves no bytes (no step 4).
-# Exit codes and final lines are the job's: 0 delivered, 5 rejected / unreachable files, 6 parked, 7 still translating
+# Exit codes and final lines are the job's: 0 delivered (or nothing to deliver: an empty files: list), 5 rejected / unreachable files, 6 parked, 7 still translating
 # at the monitor bound, any other non-zero the translate run's own. --json prints the summary on stdout (logs on stderr).
 show_sync_help() {
     cat <<HELP
@@ -10086,6 +10690,7 @@ then report the written files to PTC (guide delivery-commit, no branch). Token: 
   --json            print {run_id, uploaded, delivered, parked, rejected, delivery_commit} on stdout
 Exit codes: 0 all delivered, 5 PTC rejected or could not be reached for some files, 6 some files wait in PTC (parked:
 over-limit approval or out of credit), 7 still translating at the monitor bound; the rest was delivered in each case.
+0 too when the config's files: list is empty: one line says there is nothing to deliver (a normal state, not a failure).
 13: nothing delivered, PTC stored every file without translating it (the suite's setup is not finished).
 HELP
 }
@@ -10310,6 +10915,7 @@ main() {
                 exit 0
                 ;;
             *)
+                if ptc_unknown_option "ptc sync" "$@"; then shift "$PTC_UNKNOWN_SHIFT"; continue; fi
                 log_error "Unknown option: $1"
                 echo "Use --help for help"
                 exit 1
@@ -10321,6 +10927,10 @@ main() {
     if ! validate_args; then
         echo "Use --help for help"
         exit 1
+    fi
+    if [[ "${PTC_NOTHING_TO_DELIVER:-}" == "true" ]]; then
+        echo "Nothing to deliver: the files: list in $PTC_CONFIG_FILE is empty, so nothing was uploaded or written ('ptc init' detects the files)."
+        exit 0
     fi
     
     # Main logic
@@ -10376,7 +10986,7 @@ report_setup_incomplete() {
     [[ -z "$reason" ]] && reason="PTC stored every file without translating it: the setup of the project suite is not finished."
     echo "Nothing delivered (setup_incomplete): $reason"
     [[ "$PTC_DRY_RUN" == "true" || -z "$PTC_CONFIG_FILE" ]] && return 0
-    local source="${GITHUB_SHA:-${CI_COMMIT_SHA:-}}"
+    local source="${GITHUB_SHA:-${CI_COMMIT_SHA:-${BITBUCKET_COMMIT:-}}}"
     [[ -z "$source" ]] && source=$(git rev-parse HEAD 2>/dev/null || true)
     cmd_guide_delivery_commit --stopped-reason setup_incomplete --config-file "$PTC_CONFIG_FILE" --api-url "$PTC_API_URL" \
         ${source:+--source-commit "$source"} >&2 || true
