@@ -8,7 +8,7 @@ set -euo pipefail  # Strict mode: exit on errors, undefined variables and pipe e
 # Constants
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)" || true; readonly SCRIPT_DIR
 SCRIPT_NAME="$(basename "$0")"; readonly SCRIPT_NAME
-readonly VERSION="1.5.9"
+readonly VERSION="1.5.10"
 readonly PTC_USER_AGENT="ptc-cli/${VERSION}"
 
 # Colors for output
@@ -1456,17 +1456,13 @@ validate_args() {
             return 1
         fi
         
-        # Org #7638 (Eran, 5 Nov 2026: "Should a sync with nothing to deliver exit zero? Zero."): a files: section with
-        # no entries is nothing to deliver, a normal state; main() says so in one line and exits 0. A config with no
-        # files: section at all stays an error (parse_config_file).
-        if grep -q '^files:' "$PTC_CONFIG_FILE" 2>/dev/null && [[ -z "$(config_entries "$PTC_CONFIG_FILE")" ]]; then
-            PTC_NOTHING_TO_DELIVER=true
-            return 0
-        fi
-
         if ! parse_config_file "$PTC_CONFIG_FILE"; then
             return 1
         fi
+        # Org #7638 (Eran, 5 Nov 2026: "Should a sync with nothing to deliver exit zero? Zero."): a files: section with
+        # no entries is nothing to deliver, a normal state (parse_config_file sets the flag, #7788); main() says so in
+        # one line and exits 0, so no other argument is checked. No files: section at all stays parse_config_file's error.
+        [[ "${PTC_NOTHING_TO_DELIVER:-}" == "true" ]] && return 0
         [[ -z "${PTC_GUIDE_PROJECT_ID:-}" ]] && PTC_GUIDE_PROJECT_ID="$(ptc_config_project_id "$PTC_CONFIG_FILE")"
     fi
 
@@ -1742,8 +1738,13 @@ parse_config_file() {
     config_pairs=$(config_entries "$config_file")
     files_count=$(printf '%s' "$config_pairs" | grep -c . || true)
     if [[ "$files_count" -eq 0 ]]; then
-        log_error "No file entries found in 'files:' section of config file: $config_file"
-        return 1
+        # Org #7788 (#7638's ruling): a PRESENT files: section with no entries is a valid v1 config with nothing to
+        # deliver yet (the config PTC hands out for a repository with no resource files). Every caller reads the flag:
+        # sync prints its one nothing-to-deliver line and exits 0, guide action-run scans with the config, config
+        # validate prints its warning. A config with no files: section at all stays the error above.
+        log_debug "files: section has no entries: nothing to deliver yet"
+        PTC_NOTHING_TO_DELIVER=true
+        return 0
     fi
     
     log_debug "Found $files_count file(s) in config"
@@ -6610,7 +6611,15 @@ def config_validate(root, path):
     elif not is_lang(src):
         errors.append(f"source_locale '{src}' is not a known language code")
     if not cfg["files"]:
-        errors.append("files: has no '- file:' entries")
+        # Org #7788 (#7638's ruling): a PRESENT files: section with no entries is nothing to deliver yet, the state
+        # `ptc sync` exits 0 on; the guide hands it out for a repository with no resource files: a warning. A config with
+        # no files: section at all stays an error, as it is for `ptc sync` (parse_config_file).
+        with open(path, encoding="utf-8", errors="replace") as fh:
+            has_files_key = any(line.startswith("files:") for line in fh)
+        if has_files_key:
+            warnings.append("files: list is empty: nothing to deliver yet ('ptc init' detects the files)")
+        else:
+            errors.append("files: has no '- file:' entries")
     langs = cfg.get("languages") or cfg.get("guide", {}).get("languages") or []
     if isinstance(langs, str):
         langs = [x.strip() for x in langs.split(",") if x.strip()]
@@ -9369,7 +9378,9 @@ cmd_config() {
         log_error "Config file not found: $cfg"
         return 2
     fi
-    # The v1 structural checks the translate pipeline applies, verbatim.
+    # The v1 structural checks the translate pipeline applies, verbatim. Org #7788: a files: section with no entries
+    # parses (nothing to deliver yet; the validator prints its warning), so only a real error is replayed; a config
+    # with no files: section is still replayed and refused.
     if ! parse_config_file "$cfg" 2>/dev/null; then
         if [[ "$fmt" == "text" ]]; then parse_config_file "$cfg" || true; fi
     fi
