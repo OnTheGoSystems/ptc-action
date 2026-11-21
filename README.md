@@ -123,8 +123,8 @@ ptc-translate:
     - ptc_mr_description="$(/tmp/ptc-cli.sh guide mr-description --file /tmp/ptc-check.json)"
     # Exit 5 = partial: PTC rejected some files or could not be reached for them, and
     # every other file was written.
-    # Exit 6 = partial: some files wait in PTC (an over-limit approval, or paused
-    # out-of-credit) and every other file was written. Exit 7 = the translation is still running in PTC at the
+    # Exit 6 = partial: some files hold strings their run refused for funding
+    # and every other file was written. Exit 7 = the translation is still running in PTC at the
     # CLI's monitor bound and every finished file was written. Deliver those below,
     # then fail the job at the end with the reason.
     - ptc_rc=0
@@ -175,7 +175,17 @@ ptc-translate:
           exit 1
         fi
       fi
-      if ! git diff --cached --quiet; then
+      # Row 7992 (AGD-4): a retried job, or a re-run with nothing new from PTC, stages exactly what ptc/translations
+      # already holds on this same source commit. Then there is no second commit, no push and no second delivery report;
+      # a changed file, or a newer source commit, commits as before. The branch tip is read from the remote, one commit deep.
+      ptc_unchanged=""
+      if GIT_TERMINAL_PROMPT=0 git fetch --quiet --depth=1 origin ptc/translations 2>/dev/null \
+         && [ "$(git rev-parse 'FETCH_HEAD^{tree}')" = "$(git write-tree)" ] \
+         && git cat-file -p FETCH_HEAD | grep -qx "parent $(git rev-parse HEAD)"; then
+        ptc_unchanged=1
+        echo "ptc/translations already holds these translations on this commit: no new commit, push or delivery report."
+      fi
+      if [ -z "$ptc_unchanged" ] && ! git diff --cached --quiet; then
         git commit -m "chore(i18n): update translations via PTC [skip translations]"
         ptc_mr_description="$(/tmp/ptc-cli.sh guide mr-description --file /tmp/ptc-check.json)"
         git push -o merge_request.create \
@@ -191,7 +201,7 @@ ptc-translate:
         /tmp/ptc-cli.sh guide delivery-commit $ptc_stopped --source-commit "$CI_COMMIT_SHA" --config-file .ptc-config.yml || true
       fi
     - if [ "$ptc_rc" -eq 5 ]; then echo "PTC rejected some files or could not be reached for them (see 'Rejected by PTC' / 'Could not reach PTC' above); the rest was delivered."; exit 5; fi
-    - if [ "$ptc_rc" -eq 6 ]; then echo "Some files wait in PTC - parked for an over-limit approval, or paused out-of-credit (see the lists above); the rest was delivered. Approve in PTC or top up the credit, then re-run."; exit 6; fi
+    - if [ "$ptc_rc" -eq 6 ]; then echo "Some files wait in PTC: their run refused strings for funding (out of credit or over the budget; see the Refused lines above); the rest was delivered. Top up the credit or raise the budget in PTC, then re-run."; exit 6; fi
     - if [ "$ptc_rc" -eq 7 ]; then echo "The translation is still running in PTC (see 'Still translating in PTC' above); the finished files were delivered. Retry this job once PTC finishes, or check progress / download manually with the commands printed there."; exit 7; fi
 ```
 

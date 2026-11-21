@@ -182,9 +182,23 @@ spec:
         # tracked files - on a first run every translation is a new file, so it
         # reported "nothing changed" and left a green job with no merge request.
         if ptc_commit_scoped /tmp/ptc-worktree-before "chore(i18n): update translations via PTC [skip translations]"; then
-          git push -o merge_request.create \
-                   -o merge_request.target="$[[ inputs.mr-target-branch ]]" \
-                   -o merge_request.title="Update translations from PTC" \
-                   -f "https://gitlab-ci-token:${CI_JOB_TOKEN}@${CI_SERVER_HOST}/${CI_PROJECT_PATH}.git" HEAD:ptc/translations
+          # Row 7992 (AGD-4): a retried job, or a re-run with nothing new from PTC, commits exactly
+          # what ptc/translations already holds on this same source commit. Then that commit stays in
+          # this job and nothing is pushed; a changed file, or a newer source commit, pushes as before.
+          # The branch tip is read from the remote, one commit deep. The check follows the commit,
+          # because ptc_commit_scoped stages and commits in one step.
+          ptc_unchanged=""
+          if GIT_TERMINAL_PROMPT=0 git fetch --quiet --depth=1 origin ptc/translations 2>/dev/null \
+             && [ "$(git rev-parse 'FETCH_HEAD^{tree}')" = "$(git rev-parse 'HEAD^{tree}')" ] \
+             && git cat-file -p FETCH_HEAD | grep -qx "parent $(git rev-parse 'HEAD^')"; then
+            ptc_unchanged=1
+            echo "ptc/translations already holds these translations on this commit: no new commit, push or delivery report."
+          fi
+          if [ -z "$ptc_unchanged" ]; then
+            git push -o merge_request.create \
+                     -o merge_request.target="$[[ inputs.mr-target-branch ]]" \
+                     -o merge_request.title="Update translations from PTC" \
+                     -f "https://gitlab-ci-token:${CI_JOB_TOKEN}@${CI_SERVER_HOST}/${CI_PROJECT_PATH}.git" HEAD:ptc/translations
+          fi
         fi
       fi

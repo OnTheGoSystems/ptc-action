@@ -301,8 +301,8 @@ runs:
         # Exit 5 = partial (E20): PTC rejected some files (e.g. a processing 422) or could not be reached for them
         # (S2-R12, S2-R19), and every other file completed
         # and was written. Those translations are still delivered below; the last step then fails the job and
-        # names the rejected files. Exit 6 = partial too (S2-R15, CI-16): some files wait for an over-limit approval in
-        # PTC; every other file is delivered the same way and the last step fails the job with the approval as the
+        # names the rejected files. Exit 6 = partial too (CI-16, S2-R28-3): some files hold strings their run refused for
+        # funding; every other file is delivered the same way and the last step fails the job with the refusal as the
         # reason. Exit 7 (S2-R3B F-2, CI-16): the translation is still running in PTC at the CLI's monitor bound; every
         # finished file is delivered the same way, the report step tells PTC the run stopped, and the last step fails
         # the job with the options. Any other failure stops here, as before.
@@ -571,13 +571,14 @@ runs:
         echo "::error::PTC rejected some source files or could not be reached for them (listed under 'Rejected by PTC' / 'Could not reach PTC' in the Translate step); the other translations were delivered."
         exit 5
 
-    - name: Fail on files parked for an over-limit approval
-      # S2-R15 (CI-16): after the pull request and the delivery-commit report, so every file that was not parked is
-      # delivered; the job then fails with the reason and the remedy. The next run picks the parked files up.
+    - name: Fail on files PTC refused for funding
+      # CI-16 (S2-R28-3): after the pull request and the delivery-commit report, so every file is delivered (refused
+      # strings in the source language); the job then fails with the reason and the remedy. After a top-up the next run
+      # translates them.
       if: ${{ steps.ptc.outputs.cli-exit == '6' }}
       shell: bash
       run: |
-        echo "::error::Some files wait in PTC - parked for an over-limit approval, or paused out-of-credit (listed under 'Parked for an over-limit approval' / 'Paused out-of-credit in PTC' in the Translate step); the other translations were delivered. Approve the request in PTC (emailed to the organization's administrators), raise the translation approval limit, or top up the credit, then re-run."
+        echo "::error::Some files wait in PTC: their run refused strings for funding (out of credit or over the budget; see the Refused lines in the Translate step); the other translations were delivered. Top up the credit or raise the budget in PTC, then re-run."
         exit 6
 
     - name: Fail on files still translating in PTC

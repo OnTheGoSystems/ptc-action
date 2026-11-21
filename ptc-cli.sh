@@ -8,7 +8,7 @@ set -euo pipefail  # Strict mode: exit on errors, undefined variables and pipe e
 # Constants
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)" || true; readonly SCRIPT_DIR
 SCRIPT_NAME="$(basename "$0")"; readonly SCRIPT_NAME
-readonly VERSION="1.5.10"
+readonly VERSION="1.5.15"
 readonly PTC_USER_AGENT="ptc-cli/${VERSION}"
 
 # Colors for output
@@ -387,6 +387,142 @@ _auth_save_token() {
     return 0
 }
 
+# Org row 7927 (Eran 16 Nov 2026, MCP control plan rulings 9 and 10; CLI-30, AGD-1, WIZ-31): `ptc site link` and
+# `ptc site unlink` - the project's ONE linked WPML site, set by the human on their own machine. The site key is read like
+# `auth login` reads the token (no echo at a terminal, else one line on stdin), never from an argument or a file; the CLI
+# sends it in the request body through curl's config on stdin (-K -, with the bearer), so no argument list carries it,
+# writes it nowhere and never prints it. PTC verifies it with wpml.org and keeps it (every glossary push and pull needs it).
+cmd_site() {
+    case "${1:-}" in
+        link) shift; _site_link "$@" ;;
+        unlink) shift; _site_unlink "$@" ;;
+        ""|-h|--help)
+            printf 'Usage: %s site link [--project-id ID] [--url URL] | site unlink [--project-id ID]\n' "$SCRIPT_NAME"
+            printf '  link    links the project to one WordPress site running WPML: it asks for the site URL (unless --url) and the\n'
+            printf '          site key (not shown; one line on stdin when stdin is not a terminal), PTC verifies them with wpml.org.\n'
+            printf '          The key is never an argument and is saved nowhere on this machine.\n'
+            printf '  unlink  unlinks the project'"'"'s site after you type yes (PTC stops syncing the glossary with it).\n' ;;
+        *) log_error "Unknown site command '$1' (try: $SCRIPT_NAME site link)"; return 2 ;;
+    esac
+}
+
+# _site_args CMD ARGS... -> SITE_PID, SITE_URL; returns 2 on an unknown option (a key flag is refused by name).
+_site_args() {
+    local cmd="$1"; shift
+    SITE_PID=""; SITE_URL=""
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            --project-id) SITE_PID="${2:-}"; shift 2 ;;
+            --project-id=*) SITE_PID="${1#*=}"; shift ;;
+            --url) [[ "$cmd" == link ]] || { log_error "Unknown option for site $cmd: $1"; return 2; }; SITE_URL="${2:-}"; shift 2 ;;
+            --url=*) [[ "$cmd" == link ]] || { log_error "Unknown option for site $cmd: $1"; return 2; }; SITE_URL="${1#*=}"; shift ;;
+            --api-url) PTC_API_URL="$2"; shift 2 ;;
+            --api-url=*) PTC_API_URL="${1#*=}"; shift ;;
+            -h|--help) cmd_site --help; return 3 ;;
+            *) log_error "Unknown option for site $cmd: ${1%%=*} (the site key is never an argument: the command prompts for it)"; return 2 ;;
+        esac
+    done
+    return 0
+}
+
+# The project and the token every site door needs; prints why and returns 1 when one is missing.
+_site_target() {
+    local cmd="$1"
+    if ! _guide_project_id "$SITE_PID"; then
+        [[ "${GUIDE_LOOKUP_PROBLEM:-}" == "no token" ]] && { log_error "No API token: PTC_API_TOKEN and PTC_AGENT_TOKEN are not set (PTC_ORG_TOKEN is still accepted). $(api_token_doors)"; return 1; }
+        log_error "site $cmd needs the project id: ${GUIDE_NO_PROJECT_SOURCES}"; return 1
+    fi
+    resolve_api_token
+    SITE_TOKEN="${PTC_API_TOKEN:-${PTC_ORG_TOKEN:-}}"
+    [[ -n "$SITE_TOKEN" ]] || { log_error "No API token: PTC_API_TOKEN and PTC_AGENT_TOKEN are not set (PTC_ORG_TOKEN is still accepted). $(api_token_doors)"; return 1; }
+    return 0
+}
+
+# _site_field FILE -> the response's site_url, error message and current site url on three lines (empty when absent).
+_site_fields() {
+    python3 -c 'import json, sys
+try:
+    d = json.load(open(sys.argv[1]))
+except Exception:
+    d = {}
+d = d if isinstance(d, dict) else {}
+err = d.get("error")
+site = d.get("linked_site") or {}
+print(site.get("site_url") or "")
+print((err.get("message") if isinstance(err, dict) else err) or "")
+print(d.get("unlinked") or "")' "$1"
+}
+
+_site_link() {
+    local rc url key="" body resp code site_url="" message=""
+    _site_args link "$@"; rc=$?; [[ $rc -eq 3 ]] && return 0; [[ $rc -eq 0 ]] || return 2
+    _site_target link || return 1
+    url="$SITE_URL"
+    if [[ -z "$url" ]]; then
+        if [[ -t 0 ]]; then
+            printf 'URL of the WordPress site running WPML: ' >&2
+            IFS= read -r url || true
+        else
+            log_error "site link reads the site key from stdin: name the site with --url URL."; return 1
+        fi
+    fi
+    url="${url//$'\r'/}"; url="${url#"${url%%[![:space:]]*}"}"; url="${url%"${url##*[![:space:]]}"}"
+    [[ -n "$url" ]] || { log_error "No site URL given; nothing sent."; return 1; }
+    if [[ -t 0 ]]; then
+        printf 'Site key for %s (it is not shown) and press Enter: ' "$url" >&2
+        IFS= read -rs key || true
+        printf '\n' >&2
+    else
+        IFS= read -r key || true
+    fi
+    key="${key//$'\r'/}"; key="${key#"${key%%[![:space:]]*}"}"; key="${key%"${key##*[![:space:]]}"}"
+    [[ -n "$key" ]] || { log_error "No site key given; nothing sent."; return 1; }
+    # The body is built from stdin (printf is a shell builtin: no process shows the key) and handed to curl in its config.
+    body=$(printf '%s\n%s\n%s' "$PTC_GUIDE_PROJECT_ID" "$url" "$key" | python3 -c 'import json, sys
+pid, url, key = sys.stdin.read().split("\n", 2)
+print(json.dumps({"project_id": pid, "site_url": url, "site_key": key}))')
+    key=""
+    resp=$(ptc_mktemp)
+    body=${body//\\/\\\\}
+    local PTC_CURL_EXTRA_CFG="data-raw = \"${body//\"/\\\"}\""$'\n'
+    body=""
+    code=$(PTC_GUIDE_PROJECT_ID="" ptc_curl -sS -o "$resp" -w '%{http_code}' -X POST -H "Authorization: Bearer $SITE_TOKEN" \
+           -H 'Accept: application/json' -H 'Content-Type: application/json' "${PTC_API_URL%/}/linked_site" 2>/dev/null) || true
+    PTC_CURL_EXTRA_CFG=""
+    { IFS= read -r site_url; IFS= read -r message; } < <(_site_fields "$resp")
+    if [[ "$code" == 201 ]]; then
+        log_success "Linked ${site_url:-$url} to PTC project $PTC_GUIDE_PROJECT_ID: wpml.org verified it, and PTC keeps its glossary in step with the site. Tell your agent it is done."
+        return 0
+    fi
+    [[ "$code" == 401 ]] && { log_error "$(api_token_refused)"; return 1; }
+    log_error "PTC did not link the site (HTTP ${code:-none}): ${message:-no answer}"
+    return 1
+}
+
+_site_unlink() {
+    local rc url answer="" site_url="" message="" unlinked=""
+    _site_args unlink "$@"; rc=$?; [[ $rc -eq 3 ]] && return 0; [[ $rc -eq 0 ]] || return 2
+    _site_target unlink || return 1
+    _guide_call GET "linked_site?project_id=${PTC_GUIDE_PROJECT_ID}" || return 1
+    { IFS= read -r url; IFS= read -r message; IFS= read -r unlinked; } < <(_site_fields "$GUIDE_RESPONSE")
+    if [[ -z "$url" ]]; then
+        log_info "PTC project $PTC_GUIDE_PROJECT_ID links no site; nothing to unlink."
+        return 0
+    fi
+    printf 'Unlinking %s stops PTC syncing the project glossary with it. Type yes to unlink: ' "$url" >&2
+    IFS= read -r answer || true
+    [[ -t 0 ]] || printf '\n' >&2
+    answer="${answer//$'\r'/}"
+    if [[ "$answer" != yes ]]; then
+        log_info "Not unlinked: $url stays linked."
+        return 1
+    fi
+    _guide_call DELETE "linked_site?project_id=${PTC_GUIDE_PROJECT_ID}" || return 1
+    { IFS= read -r site_url; IFS= read -r message; IFS= read -r unlinked; } < <(_site_fields "$GUIDE_RESPONSE")
+    log_success "Unlinked ${unlinked:-$url} from PTC project $PTC_GUIDE_PROJECT_ID."
+    return 0
+}
+
 # All PTC API requests go through this wrapper so every call carries a versioned
 # User-Agent (ptc-cli/<VERSION>) and X-PTC-CLI-Version: <VERSION>. It forwards to the real curl - which the test
 # suites stub - so the header rides along as an ordinary -H the stubs already skip.
@@ -420,6 +556,9 @@ ptc_curl() {
         args+=("$a")
     done
     [[ -n "$pend" ]] && args+=(-H)
+    # Org row 7927: a caller's request body that must stay off the argument list too (`site link`'s site key) rides the
+    # same config (PTC_CURL_EXTRA_CFG, a caller's local variable, never exported).
+    [[ -n "$kcfg" && -n "${PTC_CURL_EXTRA_CFG:-}" ]] && kcfg+="$PTC_CURL_EXTRA_CFG"
     [[ -n "${PTC_HEADER_DUMP:-}" ]] && args=(-D "$PTC_HEADER_DUMP" ${args[@]+"${args[@]}"})
     if [[ -n "$kcfg" ]]; then
         curl -H "User-Agent: $PTC_USER_AGENT" -H "X-PTC-CLI-Version: $VERSION" -K - ${extra[@]+"${extra[@]}"} ${args[@]+"${args[@]}"} <<<"$kcfg"
@@ -472,8 +611,8 @@ readonly PTC_SUITE_PENDING=12
 # GAP-G46 (WPML lab run 9, CI job 4217058: all 41 files held, nothing delivered, no merge request, and the job exited 0
 # "Processing completed successfully"): a run where EVERY file was held delivered nothing, so it never exits 0. It exits
 # 13, prints PTC's reason on its own line ("Nothing delivered (setup_incomplete): <PTC's message>") and reports the stop
-# to PTC (guide delivery-commit --stopped-reason setup_incomplete). Not 6: 6 says "some files wait for an over-limit
-# approval or credit; the rest was delivered", and the job templates deliver and print that text on 6, while here nothing
+# to PTC (guide delivery-commit --stopped-reason setup_incomplete). Not 6: 6 says "some files wait in PTC: their run
+# refused strings for funding; the rest was delivered", and the job templates deliver and print that text on 6, while here nothing
 # was delivered and the remedy is finishing the suite's setup; on 13 the handed-out job templates stop at once (any code
 # but 0/5/6/7), so the job fails without pushing anything.
 readonly PTC_EXIT_SETUP_INCOMPLETE=13
@@ -727,15 +866,16 @@ http_header_value() {
 
 # Statuses that will never turn into "completed", however long we poll.
 # Polling one of these to the attempt limit is what made failures look like
-# ~8-minute timeouts. These are the two terminal entries of the server's
+# ~8-minute timeouts. "failed" is the terminal entry of the server's
 # STATUS_PRIORITY list (TranslationMemory::STATUS_PRIORITY =
-# failed, out_of_credit, queued, in_progress, completed), and both are reachable
-# on /api/v1 - "failed" wins first, since the server reports worst-status-wins.
+# failed, queued, in_progress, completed); it wins first, since the server reports worst-status-wins.
+# Runs deletions item 4 (BIL-36): the server no longer pauses a file for money; the rows a run refused
+# ship as their source and the status door names the run's refusal.
 # S2-R10 (specs/ci-integrations CI-16): a run PTC parked behind an over-limit approval is terminal for this run too:
 # "awaiting_approval" waits for a person in PTC (often longer than any CI job may run), "approval_expired" ended it.
 is_terminal_failure_status() {
     case "$1" in
-        failed|out_of_credit|awaiting_approval|approval_expired)
+        failed|awaiting_approval|approval_expired)
             return 0
             ;;
         *)
@@ -830,8 +970,6 @@ log_terminal_status() {
             log_error "$relative_file_path is waiting for an over-limit approval in PTC (the run costs more than the organization's approval limit); approve it in PTC (the request was emailed to the organization's administrators), then re-run" ;;
         approval_expired)
             log_error "$relative_file_path: the over-limit approval expired with no decision; re-run to ask again, or raise the approval limit in PTC" ;;
-        out_of_credit)
-            log_error "$relative_file_path is paused out-of-credit in PTC (the organization's credit does not cover it); it resumes when the organization tops up or upgrades" ;;
         *)
             log_error "Translation failed for $relative_file_path (status: $status)" ;;
     esac
@@ -843,23 +981,20 @@ is_approval_status() {
     [[ "$1" == "awaiting_approval" || "$1" == "approval_expired" ]]
 }
 
-# S2-R28-3 (SF-10; translation-pipeline-engines TRN-23/24): a file PTC paused out-of-credit waits for credit the way a
-# parked file waits for an approval: the run writes every complete file, lists the paused ones and exits 6, so CI
-# delivers what finished; a top-up resumes exactly the paused rows.
+# A file PTC parked behind an over-limit approval: the run writes every complete file, lists the parked ones and exits 6,
+# so CI delivers what finished. (Runs deletions item 4: no file is paused for money any more, BIL-36.)
 is_parked_status() {
-    is_approval_status "$1" || [[ "$1" == "out_of_credit" ]]
+    is_approval_status "$1"
 }
 
-# Summary block + the run's last line for parked files (an over-limit approval, or S2-R28-3 paused out-of-credit).
-# Args: completed count, then "path<TAB>status" lines on stdin. Returns 1 when files are paused out-of-credit and nothing
-# completed (nothing to deliver: the run failed), else 0.
+# Summary block + the run's last line for parked files (an over-limit approval).
+# Args: completed count, then "path<TAB>status" lines on stdin. Returns 0.
 report_parked_files() {
     local completed="$1" line awaiting=0 expired=0
-    local approvals=() credit=() parts=()
+    local approvals=() parts=()
     while IFS= read -r line; do
         [[ -z "$line" ]] && continue
         case "${line#*$'\t'}" in
-            out_of_credit) credit+=("$line") ;;
             awaiting_approval) approvals+=("$line"); awaiting=$((awaiting + 1)) ;;
             *) approvals+=("$line"); expired=$((expired + 1)) ;;
         esac
@@ -869,40 +1004,10 @@ report_parked_files() {
         for line in "${approvals[@]}"; do log_error "  ⏸ ${line%%$'\t'*} (${line#*$'\t'})"; done
         parts+=("${#approvals[@]} parked for an over-limit approval in PTC")
     fi
-    if [[ ${#credit[@]} -gt 0 ]]; then
-        log_error "Paused out-of-credit in PTC (not translated yet; they resume when the organization tops up or upgrades): ${#credit[@]}"
-        for line in "${credit[@]}"; do log_error "  ⏸ ${line%%$'\t'*} (${line#*$'\t'})"; done
-        parts+=("${#credit[@]} paused out-of-credit in PTC")
-    fi
-    if [[ ${#credit[@]} -gt 0 && "$completed" -eq 0 ]]; then
-        log_error "Run failed: nothing completed (${parts[*]}); there is nothing to deliver. Top up or upgrade in PTC (Billing), then re-run"
-        return 1
-    fi
-    (( ${#credit[@]} > 0 )) && write_paused_note "${credit[@]}"
     local joined; joined=$(printf '%s, ' "${parts[@]}"); joined=${joined%, }
     log_error "Run partial: $completed completed and written, $joined"
     (( awaiting > 0 )) && log_error "Remedy: approve the request in PTC (it was emailed to the organization's administrators); the next run picks them up once the approval is given"
     (( expired > 0 )) && log_error "Remedy: the approval expired with no decision; re-run to ask again, or raise the organization's translation approval limit in PTC (Billing > Limits); the next run picks them up once the approval is given"
-    (( ${#credit[@]} > 0 )) && log_error "Remedy: the paused files resume when the organization tops up or upgrades in PTC (Billing); the next run delivers them"
-    return 0
-}
-
-# S2-R28-3: the delivery's pull / merge request names the files paused out-of-credit, next to the preflight's limit note
-# (CI-16: GITHUB_OUTPUT limit-note, PTC_LIMIT_NOTE_FILE for the GitLab job's merge request description). Args: "path<TAB>status".
-write_paused_note() {
-    local paths=() line
-    for line in "$@"; do paths+=("${line%%$'\t'*}"); done
-    local listed; listed=$(printf '%s, ' "${paths[@]}"); listed=${listed%, }
-    local body="**Paused out-of-credit in PTC.** ${#paths[@]} file(s) were not translated because the organization's credit ran out: $listed. They resume when the organization tops up or upgrades in PTC (Billing); the next run delivers them."
-    local previous=""
-    [[ -n "${PTC_LIMIT_NOTE_FILE:-}" && -s "$PTC_LIMIT_NOTE_FILE" ]] && previous="$(cat "$PTC_LIMIT_NOTE_FILE")"$'\n\n'
-    if [[ -n "${GITHUB_OUTPUT:-}" ]]; then
-        local delim; delim="PTC_LIMIT_$(od -An -tx1 -N8 /dev/urandom | tr -d ' \n')" || true
-        printf 'limit-note<<%s\n%s\n%s\n' "$delim" "$previous$body" "$delim" >> "$GITHUB_OUTPUT"
-    fi
-    if [[ -n "${PTC_LIMIT_NOTE_FILE:-}" ]]; then
-        printf '%s\n' "$previous$body" > "$PTC_LIMIT_NOTE_FILE"
-    fi
     return 0
 }
 
@@ -928,6 +1033,153 @@ write_still_translating_note() {
     return 0
 }
 
+# Runs S4a (specs/api-cli API-14, specs/ci-integrations CI-16; SEGMENT-PARTIAL-DESIGN 5.8): a run PTC's admission cut is
+# terminal and not a failure. The status answer carries `languages` (per language words and strings translated of total)
+# and `refusal` ({reason, shortfall_cents, cut} or null). True when PTC translated nothing of the file (its run was blocked
+# or refused every language of it): there is nothing to download, and the file counts as done.
+ptc_refused_whole() {
+    local cache
+    cache=$(ptc_status_cache_file "$1")
+    [[ -f "$cache" ]] || return 1
+    # Read on every poll (see ptc_held_reason): no python3 spawn unless the answer carries a refusal object.
+    grep -q '"refusal" *: *{' "$cache" || return 1
+    python3 -c '
+import json, sys
+try:
+    s = json.load(open(sys.argv[1])); s = s.get("translation_status", s)
+except Exception:
+    sys.exit(1)
+langs = s.get("languages") or []
+sys.exit(0 if s.get("refusal") and langs and all(int(l.get("segments_translated") or 0) == 0 for l in langs) else 1)
+' "$cache" 2>/dev/null
+}
+
+# Runs S5b (specs/api-cli API-14; S4 walk F1): the run behind the file ended failed (its delivery failed, or PTC found it
+# stuck). The status answer says so with status "failed" and a failure_reason naming the run's reason, unlike failed
+# strings (failure_reason "failed"), which are delivered by the format's missing-translation rule. Prints the reason.
+ptc_run_failure() {
+    local cache
+    cache=$(ptc_status_cache_file "$1")
+    [[ -f "$cache" ]] || return 1
+    python3 -c '
+import json, sys
+try:
+    s = json.load(open(sys.argv[1])); s = s.get("translation_status", s)
+except Exception:
+    sys.exit(1)
+reason = s.get("failure_reason")
+if s.get("status") == "failed" and s.get("terminal") and reason and reason != "failed":
+    print(reason)
+    sys.exit(0)
+sys.exit(1)
+' "$cache" 2>/dev/null
+}
+
+# Runs S5k (F-4; specs/api-cli API-14, specs/billing-credits-trial BIL-37): PTC's mistake check held the file whole: its
+# run ended completed with nothing of the file translated, and the status answer carries the check's words in
+# `hold_reason`. Prints them. A held file is never a success: the caller reports it with report_run_failure (exit 1).
+ptc_held_reason() {
+    local cache
+    cache=$(ptc_status_cache_file "$1")
+    [[ -f "$cache" ]] || return 1
+    # Read on every poll of every file: no python3 spawn unless the answer names a hold (WF-20: the poll round stays
+    # one status call and one download call per file, so the server's interval sets the pace on a loaded runner).
+    grep -q '"hold_reason" *: *"' "$cache" || return 1
+    python3 -c '
+import json, sys
+try:
+    s = json.load(open(sys.argv[1])); s = s.get("translation_status", s)
+except Exception:
+    sys.exit(1)
+reason = s.get("hold_reason")
+if s.get("terminal") and reason:
+    print(reason)
+    sys.exit(0)
+sys.exit(1)
+' "$cache" 2>/dev/null
+}
+
+# Runs S5b: one line for a file whose run failed; the file counts as failed, so the run exits with the error code.
+# Runs S5g (S4 walk 5 W5-2): a newline first, so the line never runs on from the progress counter's line.
+report_run_failure() {
+    printf '\nFailed: %s\n' "$2" >&2
+}
+
+# Runs S4a: after the run, one line per language of the refused files, then ONE refusal line for the whole run:
+# "Refused: <reason>; <N> words in <M> languages not translated; <shortfall> short" (", nothing translated" when PTC
+# translated none of the files). Prints nothing when no file was refused. Ruling 2 (Eran 2026-11-08; ci-integrations
+# CI-16, S2-R28-3): it sets PTC_RUN_REFUSED (partial, or nothing when nothing was translated), which the run's exit reads:
+# 6 after delivering the written files, 1 when nothing was translated.
+report_run_refusals() {
+    PTC_RUN_REFUSED=""
+    local base_dir="$1"; shift
+    local caches=() file
+    for file in "$@"; do
+        caches+=("$(ptc_status_cache_file "$(get_relative_path "$file" "$base_dir")")")
+    done
+    [[ ${#caches[@]} -gt 0 ]] || return 0
+    local out
+    out=$(python3 -c '
+import json, os, sys
+REASONS = {"cap_reached": "the monthly budget is reached", "allowance_reached": "the pay-as-you-go allowance for this cycle is used up",
+           "payment_failed": "your last payment did not go through", "subscription_lapsed": "the subscription has lapsed",
+           "trial_exhausted": "the trial credits are used up",
+           "insufficient_balance": "the balance is not enough",
+           "trial_expired": "the trial has ended and there is no plan", "subscription_unpaid": "the subscription is unpaid",
+           "subscription_canceled": "the subscription is canceled", "subscription_incomplete": "the subscription is not active"}
+langs, refusal, translated_any = {}, None, False
+for path in sys.argv[1:]:
+    if not os.path.isfile(path):
+        continue
+    try:
+        s = json.load(open(path)); s = s.get("translation_status", s)
+    except Exception:
+        continue
+    for l in s.get("languages") or []:
+        if int(l.get("segments_translated") or 0) > 0:
+            translated_any = True
+    if not s.get("refusal"):
+        continue
+    refusal = refusal or s["refusal"]
+    for l in s.get("languages") or []:
+        a = langs.setdefault(l["code"], [0, 0, 0, 0])
+        a[0] += int(l.get("words_translated") or 0); a[1] += int(l.get("words_total") or 0)
+        a[2] += int(l.get("segments_translated") or 0); a[3] += int(l.get("segments_total") or 0)
+if refusal is None:
+    sys.exit(0)
+for code in sorted(langs):
+    w, wt, sg, st = langs[code]
+    print(f"  {code}: {w} of {wt} words translated ({sg} of {st} strings)")
+missing = {c: a[1] - a[0] for c, a in langs.items() if a[1] - a[0] > 0}
+cents = refusal.get("shortfall_cents")
+short = f"{int(cents) / 100:.2f} EUR short" if cents else "shortfall unknown"
+reason = REASONS.get(refusal.get("reason"), refusal.get("reason") or "refused")
+n = len(missing)
+languages = "language" if n == 1 else "languages"
+line = f"Refused: {reason}; {sum(missing.values())} words in {n} {languages} not translated; {short}"
+print(line + ("" if translated_any else "; nothing translated"))
+' "${caches[@]}" 2>/dev/null) || return 0
+    [[ -n "$out" ]] || return 0
+    printf '%s\n' "$out" >&2
+    if [[ "$out" == *"; nothing translated"* ]]; then PTC_RUN_REFUSED=nothing; else PTC_RUN_REFUSED=partial; fi
+    return 0
+}
+
+# Ruling 2 (CI-16, S2-R28-3): the exit of a run whose refusal report_run_refusals printed, after the written files were
+# delivered: 6 when something was translated (the refused strings are written in the source language), 1 when nothing
+# was. Prints nothing and answers 0 when the run refused nothing.
+refused_run_exit_code() {
+    case "${PTC_RUN_REFUSED:-}" in
+        partial)
+            log_error "Run partial: $1 completed and written; some files wait in PTC: their run refused strings for funding (the Refused lines above; those strings are written in the source language). Top up the credit or raise the budget in PTC, then re-run."
+            printf '6' ;;
+        nothing)
+            log_error "Nothing translated: the run refused every string for funding (the Refused line above). Top up the credit or raise the budget in PTC, then re-run."
+            printf '1' ;;
+        *) printf '0' ;;
+    esac
+}
+
 # 0 completed, 1 failed (terminal), 2 keep polling, 4 rejected (terminal: PTC will never translate this file),
 # 5 failed segments: download it; a served archive is delivered like a completed file (S2-R2 item 1).
 classify_monitored_status() {
@@ -936,6 +1188,13 @@ classify_monitored_status() {
 
     if [[ "$status" == "completed" ]]; then
         return 0
+    fi
+
+    # Runs S5b: the run ended failed (not failed strings): nothing to deliver, one line, a failure.
+    local run_failure
+    if [[ "$status" == "failed" ]] && run_failure=$(ptc_run_failure "$relative_file_path"); then
+        report_run_failure "$relative_file_path" "$run_failure"
+        return 1
     fi
 
     # S2-R2 item 1 (Eran 2026-10-01 decision 2, F5; specs/ci-integrations CI-7): one failed segment never blocks the
@@ -1208,6 +1467,14 @@ written_paths_dir() {
 # environment. Those variables are consulted only after git has failed to
 # answer, so a normal checkout is unaffected.
 get_current_branch() {
+    local branch
+    branch=$(ptc_detected_branch)
+    echo "${branch:-main}"
+}
+
+# The branch this run is on: git's checked-out branch, else the CI's branch variable; nothing when neither names one
+# (get_current_branch tags such a run "main"; the branches: gate translates it as before).
+ptc_detected_branch() {
     local branch=""
 
     if command -v git >/dev/null 2>&1 && git rev-parse --is-inside-work-tree >/dev/null 2>&1; then
@@ -1225,11 +1492,22 @@ get_current_branch() {
         branch="${CI_COMMIT_REF_NAME:-${GITHUB_REF_NAME:-${BITBUCKET_BRANCH:-${BRANCH_NAME:-${CIRCLE_BRANCH:-}}}}}"
     fi
 
-    if [[ -z "$branch" ]]; then
-        branch="main"
-    fi
-
     echo "$branch"
+}
+
+# Row 7926 (CLI-17b, agent-guide AGD-4): a config with `branches:` names the branches PTC translates (names or * patterns;
+# ["*"] = every branch). In CI, a translate run on a branch the list does not name translates nothing: one line naming the
+# branch and the list, exit 0 (a feature-branch pipeline stays green), before any upload. No key, no CI, or no branch
+# detected: the run goes on as before. -> 0 when this run translates, 1 (the line printed) when it does not.
+ptc_branch_gate() {
+    local cfg="$1" branch listed
+    [[ -f "$cfg" ]] && grep -q '^branches:' "$cfg" 2>/dev/null && _guide_in_ci || return 0
+    branch=$(ptc_detected_branch)
+    [[ -n "$branch" ]] || return 0
+    listed=$(_ptc_py branch-gate "$cfg" "$branch" 2>/dev/null) && return 0
+    [[ -n "$listed" ]] || return 0
+    echo "Not translated: branch '$branch' is not in the branches: list of $cfg ($listed), so nothing was uploaded or written. Add it to branches: to translate it."
+    return 1
 }
 
 # Function to get base directory (git root or current working directory)
@@ -2621,7 +2899,17 @@ process_files_in_steps() {
             status_output=$(get_translation_status_quiet "$relative_file_path" "$PTC_FILE_TAG_NAME")
             local status_result=$?
             
-            if [[ $status_result -eq 0 ]]; then
+            local held_reason=""
+            if [[ $status_result -eq 0 ]] && held_reason=$(ptc_held_reason "$relative_file_path"); then
+                # Runs S5k (F-4): the mistake check held the file: one Failed: line with its words, nothing downloaded.
+                report_run_failure "$relative_file_path" "$held_reason"
+                failed_files+=("$file")
+                set_file_status "$file" "failed"
+            elif [[ $status_result -eq 0 ]] && ptc_refused_whole "$relative_file_path"; then
+                # Runs S4a: PTC's admission translated nothing of this file (refused): done, nothing to download.
+                set_file_status "$file" "completed"
+                completed_files+=("$file")
+            elif [[ $status_result -eq 0 ]]; then
                 # Translation completed, download it
                 set_file_status "$file" "completed"
                 # 2 means the archive is not ready yet (HTTP 202);
@@ -2642,12 +2930,17 @@ process_files_in_steps() {
             elif [[ $status_result -eq 3 ]]; then
                 # Terminal failure - stop polling this file, it cannot recover
                 local terminal_status; terminal_status=$(echo "$status_output" | cut -d'|' -f1)
-                local partial_result=1
-                if [[ "$terminal_status" == "failed" ]]; then
+                local partial_result=1 run_failure=""
+                if [[ "$terminal_status" == "failed" ]] && run_failure=$(ptc_run_failure "$relative_file_path"); then
+                    # Runs S5b: the run ended failed: one line, a failure, nothing downloaded.
+                    report_run_failure "$relative_file_path" "$run_failure"
+                    partial_result=7
+                elif [[ "$terminal_status" == "failed" ]]; then
                     deliver_failed_status_file "$relative_file_path" "$base_dir" >/dev/null 2>&1
                     partial_result=$?
                 fi
                 case $partial_result in
+                    7) failed_files+=("$file"); set_file_status "$file" "failed" ;;
                     0) completed_files+=("$file"); set_file_status "$file" "completed" ;;
                     2) still_monitoring+=("$file"); set_file_status "$file" "processing" ;;
                     *)
@@ -2704,6 +2997,7 @@ process_files_in_steps() {
     echo
     
     # Report final results
+    report_run_refusals "$base_dir" "${processed_files[@]}"
     log_info "=== FINAL RESULTS ==="
     log_success "Completed files: ${#completed_files[@]}"
     if [[ ${#completed_files[@]} -gt 0 ]]; then
@@ -2754,6 +3048,9 @@ process_files_in_steps() {
         log_error "Run incomplete: ${#completed_files[@]} completed, ${#failed_files[@]} failed, ${#monitoring_files[@]} unfinished"
         return 1
     fi
+
+    local refused_rc; refused_rc=$(refused_run_exit_code "${#completed_files[@]}")
+    [[ "$refused_rc" == 0 ]] || return "$refused_rc"
 
     if [[ ${#completed_files[@]} -gt 0 ]]; then
         log_success "Step-based processing completed successfully"
@@ -2962,8 +3259,16 @@ process_files_in_steps_with_config() {
                     # polling rather than deciding either way. translation_status
                     # routinely reports a file ready a moment before its archive
                     # is, so treating that as failure would fail healthy runs.
-                    local download_result=0
-                    download_translations "$relative_file_path" "$PTC_FILE_TAG_NAME" "$base_dir" || download_result=$?
+                    local download_result=0 held_reason=""
+                    if held_reason=$(ptc_held_reason "$relative_file_path"); then
+                        # Runs S5k (F-4): the mistake check held the file: one Failed: line with its words, nothing downloaded.
+                        report_run_failure "$relative_file_path" "$held_reason"
+                        download_result=held
+                    elif ptc_refused_whole "$relative_file_path"; then
+                        log_debug "Nothing translated for $relative_file_path (PTC refused it); nothing to download"
+                    else
+                        download_translations "$relative_file_path" "$PTC_FILE_TAG_NAME" "$base_dir" || download_result=$?
+                    fi
 
                     case $download_result in
                         0)
@@ -2972,6 +3277,9 @@ process_files_in_steps_with_config() {
                             ;;
                         2)
                             still_monitoring+=("$file")
+                            ;;
+                        held)
+                            failed_files+=("$file")
                             ;;
                         *)
                             log_warning "Failed to download translations for: $relative_file_path"
@@ -3037,6 +3345,7 @@ process_files_in_steps_with_config() {
     echo
     
     # Report final results
+    report_run_refusals "$base_dir" "${processed_files[@]}"
     log_info "=== FINAL RESULTS ==="
     log_success "Completed files: ${#completed_files[@]}"
     if [[ ${#completed_files[@]} -gt 0 ]]; then
@@ -3137,6 +3446,9 @@ process_files_in_steps_with_config() {
         return 1
     fi
 
+    local refused_rc; refused_rc=$(refused_run_exit_code "${#completed_files[@]}")
+    [[ "$refused_rc" == 0 ]] || return "$refused_rc"
+
     if [[ ${#completed_files[@]} -gt 0 ]]; then
         log_success "Step-based processing completed successfully"
         return 0
@@ -3211,8 +3523,7 @@ preflight_check() {
 
     # The balance headers ride on every api/v1 response, so the languages call
     # above already carries them - no separate request needed for the numbers.
-    local trial_balance prepaid_balance runs_remaining run_open
-    trial_balance=$(http_header_value "$header_file" "X-PTC-TRIAL-BALANCE")
+    local prepaid_balance runs_remaining run_open
     prepaid_balance=$(http_header_value "$header_file" "X-PTC-PREPAID-BALANCE")
     runs_remaining=$(http_header_value "$header_file" "X-PTC-TRIAL-API-RUNS-REMAINING")
     run_open=$(http_header_value "$header_file" "X-PTC-TRIAL-API-RUN-OPEN")
@@ -3222,7 +3533,7 @@ preflight_check() {
     # PTC refuses this push (HTTP 402) and delivers nothing: say so once and stop before any upload. Only on PTC's
     # explicit "false": an open window (the rest of an admitted push) runs, and a server without the header runs as before.
     if [[ "$runs_remaining" == "0" && "$run_open" == "false" ]]; then
-        log_error "Nothing was uploaded: the trial's free automatic deliveries are used up, so PTC would refuse this sync (HTTP 402). Upgrade in PTC (Billing) to continue."
+        log_error "Nothing was uploaded: your trial deliveries are out, so PTC would refuse this sync (HTTP 402). Upgrade to Pro to keep delivering on every push (PTC Billing)."
         return 1
     fi
 
@@ -3280,28 +3591,26 @@ preflight_check() {
         # production: plan=pro, status=unlimited, active=true, both wallets 0.)
         balance_note="unlimited"
     elif [[ "$plan" == "trial" ]]; then
-        balance_note="${trial_balance:-unknown} trial words"
-        if [[ "$trial_balance" == "0" ]]; then
-            log_warning "Trial word balance is 0 - translations will not be produced until it is topped up."
-        fi
+        # Trial as a sample (Eran, 6 Nov 2026): the trial's words are an internal guard, never counted before it is
+        # reached, so the trial line names the plan only (no words, no deliveries countdown, no zero-balance warning).
+        balance_note=""
     elif [[ -n "$plan" ]]; then
         balance_note="${prepaid_balance:-unknown} prepaid words"
         if [[ "$prepaid_balance" == "0" ]]; then
             log_warning "Prepaid word balance is 0 - translations will not be produced until it is topped up."
         fi
     else
-        # Plan unknown, so report both wallets rather than guessing which one
-        # pays - and stay quiet about a zero in a wallet that may be unused.
-        balance_note="${trial_balance:-unknown} trial / ${prepaid_balance:-unknown} prepaid words"
+        # Plan unknown: report the prepaid wallet only (trial as a sample, 6 Nov 2026: no trial words), and stay
+        # quiet about a zero in a wallet that may be unused.
+        balance_note="${prepaid_balance:-unknown} prepaid words"
     fi
 
-    if [[ "$sub_status" != "unlimited" ]]; then
-        local gate_balance="$prepaid_balance"
-        [[ "$plan" == "trial" ]] && gate_balance="$trial_balance"
-        census_limit_check "$gate_balance"
+    # Trial as a sample: no words limit is announced before the trial's guard is reached, so no census check on a trial.
+    if [[ "$sub_status" != "unlimited" && "$plan" != "trial" ]]; then
+        census_limit_check "$prepaid_balance"
     fi
 
-    log_success "Preflight OK: source=${project_source:-unknown}, plan=${plan:-unknown}, balance=${balance_note}"
+    log_success "Preflight OK: source=${project_source:-unknown}, plan=${plan:-unknown}${balance_note:+, balance=${balance_note}}"
     return 0
 }
 
@@ -3925,9 +4234,6 @@ get_status_char() {
             ;;
         "failed"|"error")
             echo -e "${RED}F${NC}"
-            ;;
-        "out_of_credit")
-            echo -e "${RED}\$${NC}"
             ;;
         "awaiting_approval"|"approval_expired")
             echo -e "${RED}A${NC}"
@@ -4990,8 +5296,8 @@ ptc-translate:
     - ptc_mr_description="\$(/tmp/ptc-cli.sh guide mr-description --file /tmp/ptc-check.json)"
     # Exit 5 = partial: PTC rejected some files or could not be reached for them, and
     # every other file was written.
-    # Exit 6 = partial: some files wait in PTC (an over-limit approval, or paused
-    # out-of-credit) and every other file was written. Exit 7 = the translation is still running in PTC at the
+    # Exit 6 = partial: some files wait in PTC and every
+    # other file was written. Exit 7 = the translation is still running in PTC at the
     # CLI's monitor bound and every finished file was written. Deliver those below,
     # then fail the job at the end with the reason.
     - ptc_rc=0
@@ -5042,7 +5348,17 @@ ptc-translate:
           exit 1
         fi
       fi
-      if ! git diff --cached --quiet; then
+      # Row 7992 (AGD-4): a retried job, or a re-run with nothing new from PTC, stages exactly what ptc/translations
+      # already holds on this same source commit. Then there is no second commit, no push and no second delivery report;
+      # a changed file, or a newer source commit, commits as before. The branch tip is read from the remote, one commit deep.
+      ptc_unchanged=""
+      if GIT_TERMINAL_PROMPT=0 git fetch --quiet --depth=1 origin ptc/translations 2>/dev/null \\
+         && [ "\$(git rev-parse 'FETCH_HEAD^{tree}')" = "\$(git write-tree)" ] \\
+         && git cat-file -p FETCH_HEAD | grep -qx "parent \$(git rev-parse HEAD)"; then
+        ptc_unchanged=1
+        echo "ptc/translations already holds these translations on this commit: no new commit, push or delivery report."
+      fi
+      if [ -z "\$ptc_unchanged" ] && ! git diff --cached --quiet; then
         git commit -m "chore(i18n): update translations via PTC [skip translations]"
         # A CLI older than this job (another PTC_CLI_URL copy, an older release) may not know --written-manifest:
         # the job passes it only when the CLI's help names it for mr-description.
@@ -5062,7 +5378,7 @@ ptc-translate:
         /tmp/ptc-cli.sh guide delivery-commit \$ptc_stopped --source-commit "\$CI_COMMIT_SHA" --config-file .ptc-config.yml || true
       fi
     - if [ "\$ptc_rc" -eq 5 ]; then echo "PTC rejected some files or could not be reached for them (see 'Rejected by PTC' / 'Could not reach PTC' above); the rest was delivered."; exit 5; fi
-    - if [ "\$ptc_rc" -eq 6 ]; then echo "Some files wait in PTC - parked for an over-limit approval, or paused out-of-credit (see the lists above); the rest was delivered. Approve in PTC or top up the credit, then re-run."; exit 6; fi
+    - if [ "\$ptc_rc" -eq 6 ]; then echo "Some files wait in PTC (see the lists above); the rest was delivered. Re-run to deliver them."; exit 6; fi
     - if [ "\$ptc_rc" -eq 7 ]; then echo "The translation is still running in PTC (see 'Still translating in PTC' above); the finished files were delivered. Retry this job once PTC finishes, or check progress / download manually with the commands printed there."; exit 7; fi
 EOF
 }
@@ -5122,8 +5438,8 @@ definitions:
           # They are printed here too, so every step log shows them, also when there is nothing new to push.
           - ptc_mr_description="$(/tmp/ptc-cli.sh guide mr-description --file /tmp/ptc-check.json)"
           # Exit 5 = partial: PTC rejected some files or could not be reached for them, and every other file was written.
-          # Exit 6 = partial: some files wait in PTC (an over-limit approval, or paused out-of-credit) and every other file
-          # was written. Exit 7 = the translation is still running in PTC at the CLI's monitor bound and every finished file
+          # Exit 6 = partial: some files hold strings their run refused for funding (Runs deletions: no approvals) and
+          # every other file was written. Exit 7 = the translation is still running in PTC at the CLI's monitor bound and every finished file
           # was written. Deliver those below, then fail the step at the end with the reason.
           - ptc_rc=0
           - /tmp/ptc-cli.sh --config-file .ptc-config.yml --written-manifest /tmp/ptc-written || ptc_rc=$?
@@ -5162,7 +5478,17 @@ definitions:
                 exit 1
               fi
             fi
-            if ! git diff --cached --quiet; then
+            # Row 7992 (AGD-4): a retried job, or a re-run with nothing new from PTC, stages exactly what ptc/translations
+            # already holds on this same source commit. Then there is no second commit, no push and no second delivery report;
+            # a changed file, or a newer source commit, commits as before. The branch tip is read from the remote, one commit deep.
+            ptc_unchanged=""
+            if GIT_TERMINAL_PROMPT=0 git fetch --quiet --depth=1 origin ptc/translations 2>/dev/null \
+               && [ "$(git rev-parse 'FETCH_HEAD^{tree}')" = "$(git write-tree)" ] \
+               && git cat-file -p FETCH_HEAD | grep -qx "parent $(git rev-parse HEAD)"; then
+              ptc_unchanged=1
+              echo "ptc/translations already holds these translations on this commit: no new commit, push or delivery report."
+            fi
+            if [ -z "$ptc_unchanged" ] && ! git diff --cached --quiet; then
               git commit -m "chore(i18n): update translations via PTC [skip translations]"
               # A CLI older than this job (another PTC_CLI_URL copy, an older release) may not know --written-manifest:
               # the job passes it only when the CLI's help names it for mr-description.
@@ -5187,7 +5513,7 @@ definitions:
               /tmp/ptc-cli.sh guide delivery-commit $ptc_stopped --source-commit "$BITBUCKET_COMMIT" --config-file .ptc-config.yml || true
             fi
           - if [ "$ptc_rc" -eq 5 ]; then echo "PTC rejected some files or could not be reached for them (see 'Rejected by PTC' / 'Could not reach PTC' above); the rest was delivered."; exit 5; fi
-          - if [ "$ptc_rc" -eq 6 ]; then echo "Some files wait in PTC - parked for an over-limit approval, or paused out-of-credit (see the lists above); the rest was delivered. Approve in PTC or top up the credit, then re-run."; exit 6; fi
+          - if [ "$ptc_rc" -eq 6 ]; then echo "Some files wait in PTC: their run refused strings for funding (out of credit or over the budget; see the Refused lines above); the rest was delivered. Top up the credit or raise the budget in PTC, then re-run."; exit 6; fi
           - if [ "$ptc_rc" -eq 7 ]; then echo "The translation is still running in PTC (see 'Still translating in PTC' above); the finished files were delivered. Run the pipeline again (Run pipeline > ptc-translate) once PTC finishes, or check progress / download manually with the commands printed there."; exit 7; fi
 
 pipelines:
@@ -6572,6 +6898,13 @@ def read_config(path):
             if m.group(2):
                 v = m.group(2)
                 cfg[section] = [unquote(x.strip()) for x in v[1:-1].split(",") if x.strip()] if v.startswith("[") and v.endswith("]") else unquote(v)
+            elif section == "branches":  # row 7923: a block list (`- develop` lines) follows
+                cfg[section] = []
+            continue
+        if section == "branches" and isinstance(cfg.get("branches"), list):
+            m = re.match(r"^\s*-\s*(.*?)\s*$", line)
+            if m:
+                cfg["branches"].append(unquote(m.group(1)))
             continue
         if section == "files":
             m = re.match(r"^\s*-\s*file:\s*(.+?)\s*$", line)
@@ -6626,6 +6959,21 @@ def config_validate(root, path):
     for l in langs:
         if not is_lang(l):
             errors.append(f"guide.languages: '{l}' is not a known language code")
+    # Row 7923 (CLI-17a): `branches:` lists the branches PTC translates (names or * patterns; ["*"] = every branch); PTC
+    # makes the project's watched branches equal to it on a verified run of the guide session's branch.
+    if "branches" in cfg:
+        br = cfg["branches"]
+        if not isinstance(br, list):
+            errors.append(f"branches: '{br}' is not a list (write branches: [develop], or branches: [\"*\"] for every branch)")
+        elif not br:
+            errors.append("branches: is empty (name the branches to translate, or [\"*\"] for every branch)")
+        for b in (br if isinstance(br, list) else []):
+            if b == "":
+                errors.append("branches: an entry is empty")
+            elif re.search(r"\s", b):
+                errors.append(f"branches: '{b}' has a space; a branch name has none")
+            elif not re.match(r"^[^~^:?\[\\]{1,255}$", b):
+                errors.append(f"branches: '{b}' is not a branch name or * pattern")
     def parse_map(raw_map, where):
         """WF-5: {PTC code: file locale}; {{lang}} expands to the file locale. Malformed pairs are named under WHERE."""
         parsed = {}
@@ -6691,6 +7039,11 @@ def config_validate(root, path):
         errors.append(f"output '{p}' is ignored by git ({rule}): translated files written there can never be committed")
     if "api_token" in cfg:
         warnings.append("api_token: is deprecated and ignored; use PTC_API_TOKEN")
+    # Org row 7927 (MCP control plan ruling 9; AGD-11): `linked_site:` names the project's one linked WPML site by URL
+    # (the site key is never in the file: `ptc site link` sends it to PTC).
+    linked = cfg.get("linked_site")
+    if linked is not None and not (isinstance(linked, str) and re.match(r"^https?://[^\s/]+\S*$", linked)):
+        errors.append(f"linked_site '{linked}' is not a site URL (http:// or https://)")
     return {"valid": not errors, "errors": errors, "warnings": warnings, "config": cfg, "files": report,
             "ignored_outputs": [p for p, _ in ignored]}
 
@@ -7420,6 +7773,7 @@ def estimate(root, paths, langs, rate, balance, remote=None, covered=False):
     # remote: {path: source words per language} from PTC's dry-run estimate (S2-R3 item 3) for the files no local
     # reader covers; a path without a quote there stays in `unquoted`.
     # covered (GAP-JOBS F2, AGD-7): the subscription covers the run, so there is no word balance and no shortfall.
+    # covered="trial" (trial as a sample, 6 Nov 2026): a trial shows no word balance and no shortfall either.
     files, unquoted = [], []
     remote = remote or {}
     for p in paths:
@@ -7449,7 +7803,7 @@ def estimate(root, paths, langs, rate, balance, remote=None, covered=False):
            "balance_words": num(balance) if balance is not None else None,
            "shortfall_words": num(max(0, words_total - balance)) if balance is not None else None}
     if covered:
-        res.update({"balance_words": None, "shortfall_words": 0, "covered_by": "subscription"})
+        res.update({"balance_words": None, "shortfall_words": 0, "covered_by": covered if covered == "trial" else "subscription"})
     return res
 
 
@@ -8800,6 +9154,13 @@ def main(argv):
         return 0
     if cmd == "project-answer":
         return project_answer(argv[1], local=len(argv) > 2 and argv[2] == "local")
+    if cmd == "branch-gate":  # row 7926: exit 0 when argv[2] is listed (or there is no list), else print the list, exit 3
+        import fnmatch
+        listed = read_config(argv[1]).get("branches")
+        if not isinstance(listed, list) or not listed or any(fnmatch.fnmatchcase(argv[2], b) for b in listed):
+            return 0
+        print(", ".join(listed))
+        return 3
     if cmd == "field":
         v = json.load(open(argv[1]))
         for k in argv[2].split("."):
@@ -8897,7 +9258,7 @@ def main(argv):
                         remote[path] = round(float(q.get("words_required") or sum(br.values())) / len(br), 2)
                 except Exception:
                     pass
-        covered = balance == "covered"
+        covered = {"covered": True, "trial": "trial"}.get(balance, False)
         res = estimate(root, paths, langs, float(rate) if rate else None, float(balance) if balance and not covered else None, remote, covered)
         if fmt == "unquoted":
             print("\n".join(res["unquoted"]))
@@ -8916,7 +9277,9 @@ def main(argv):
             print(f"{l}: {res['words_per_language']} words, {c} credits")
         cost = f", {res['credits_total']} credits" if res["credits_total"] is not None else ""
         print(f"Total: {res['words_total']} words{cost} ({len(res['languages'])} languages)")
-        if res.get("covered_by"):
+        if res.get("covered_by") == "trial":
+            print("Balance: trial (no word balance applies)")
+        elif res.get("covered_by"):
             print("Balance: covered by the subscription (no word balance applies, nothing is short)")
         elif res["balance_words"] is not None:
             short = res["shortfall_words"]
@@ -9206,16 +9569,18 @@ cmd_estimate() {
             --rate) rate="$2"; shift 2 ;;
             --balance) balance="$2"; shift 2 ;;
             --covered) balance=covered; shift ;;
+            --trial) balance=trial; shift ;;
             --api-url) PTC_API_URL="$2"; shift 2 ;;
             --file) files+=("$2"); shift 2 ;;
             --project-id) project_flag="$2"; shift 2 ;;
             --exclude) excludes+="$2"$'\n'; shift 2 ;;
             --check-cases) cases="$2"; shift 2 ;;
             -h|--help)
-                echo "Usage: $SCRIPT_NAME estimate [--json] [--offline] [-d DIR] [-c CONFIG] [--languages de,fr] [--rate CREDITS_PER_WORD] [--balance WORDS | --covered] [--file PATH]... [--exclude PATH]... [--project-id N]"
+                echo "Usage: $SCRIPT_NAME estimate [--json] [--offline] [-d DIR] [-c CONFIG] [--languages de,fr] [--rate CREDITS_PER_WORD] [--balance WORDS | --covered | --trial] [--file PATH]... [--exclude PATH]... [--project-id N]"
                 echo "  --project-id N  the PTC project an agent token (PTC_AGENT_TOKEN) quotes for; default: PTC_GUIDE_PROJECT_ID, the"
                 echo "                  config's guide.project_id, then the guide session in .ptc/session.json."
                 echo "  --covered  the subscription covers the run (PTC's estimate task says so): no word balance, no shortfall."
+                echo "  --trial    the organization is on the trial (PTC's estimate task says so): no word balance, no shortfall."
                 echo "  --exclude PATH  leave a configured file out (repeatable); with --languages it quotes a narrowed scope."
                 echo "  Quote: words by PTC's rule over the configured source files x languages x rate. PO/POT, YAML and JSON are"
                 echo "  counted locally; every other configured file (PHP, .strings, .properties, XML, ...) is counted by PTC's"
@@ -9250,10 +9615,12 @@ cmd_estimate() {
 import json, sys
 d = json.load(sys.stdin)
 b = d.get("balance_words")
-if d.get("covered_by"):
+if d.get("covered_by") == "trial":
+    b = "trial"
+elif d.get("covered_by"):
     b = "covered"
 elif b is None and "balance_words" not in d:
-    b = float(d.get("trial_balance") or 0) + float(d.get("prepaid_balance") or 0)
+    b = float(d.get("prepaid_balance") or 0)  # trial as a sample (6 Nov 2026): prepaid words only
 print(d.get("word_cost") if d.get("word_cost") is not None else "", "" if b is None else b)')
         if [[ -z "$rate" ]]; then rate="${vals%% *}"; fi
         if [[ -z "$balance" ]]; then balance="${vals#* }"; fi
@@ -10538,6 +10905,14 @@ except Exception:
         [[ -n "$out" ]] && cp "$resp" "$out"
         _guide_cache_ids "" "${PTC_GUIDE_PROJECT_ID:-}" "$resp"  # org #7188: the project this run reported to
         _ptc_py pushes "$resp" >&2 || true  # L11 (SF-31): e.g. the subscribe push of a refused push
+        # Row 7924 (CLI-17c, agent-guide AGD-4): what PTC did with the config file's removals, one line each (a removal
+        # awaiting the human's answer and where to give it, a kept difference, a list too short to remove from).
+        python3 -c 'import json,sys
+try:
+    for line in (json.load(open(sys.argv[1])).get("config_follow") or {}).get("notices") or []:
+        print("PTC config: %s" % line)
+except Exception:
+    pass' "$resp" >&2 || true
         return 0
     fi
     if _guide_transient_code "$code"; then
@@ -10581,6 +10956,11 @@ cmd_guide_action_run() {
     [[ -z "$cfg" && -f "$PTC_PROJECT_DIR/.ptc-config.yml" ]] && cfg="$PTC_PROJECT_DIR/.ptc-config.yml"
     # Org #7732 (AGD-8): the config's api_url like every other guide door (cmd_guide dispatches here before its own call).
     _config_api_url_fallback "${cfg:-$PTC_PROJECT_DIR/.ptc-config.yml}"
+    # Row 7926 (CLI-17b): on a branch branches: does not name, the report goes only for a guide config (its guide: block
+    # is how PTC knows the setup proof run: the run's config names the session, on the agent's own setup branch).
+    if [[ -n "$cfg" ]] && ! grep -q '^guide:' "$cfg" 2>/dev/null && ! ( cd "$PTC_PROJECT_DIR" && ptc_branch_gate "$cfg" ); then
+        return 0
+    fi
     GUIDE_RUN_KEY=""
     cmd_guide_action_run_impl "$cfg" "$project_id" "$out" || return $?
     [[ -n "$GUIDE_RUN_KEY" ]] && printf 'run_key: %s\n' "$GUIDE_RUN_KEY"
@@ -10699,8 +11079,8 @@ then report the written files to PTC (guide delivery-commit, no branch). Token: 
   -d DIR            the product directory (suite products); the config is DIR/.ptc-config.yml unless -c names one
   --dry-run         report the run and the plan; upload, download and the delivery report are skipped
   --json            print {run_id, uploaded, delivered, parked, rejected, delivery_commit} on stdout
-Exit codes: 0 all delivered, 5 PTC rejected or could not be reached for some files, 6 some files wait in PTC (parked:
-over-limit approval or out of credit), 7 still translating at the monitor bound; the rest was delivered in each case.
+Exit codes: 0 all delivered, 5 PTC rejected or could not be reached for some files, 6 some files wait in PTC (their run
+refused strings for funding), 7 still translating at the monitor bound; the rest was delivered in each case.
 0 too when the config's files: list is empty: one line says there is nothing to deliver (a normal state, not a failure).
 13: nothing delivered, PTC stored every file without translating it (the suite's setup is not finished).
 HELP
@@ -10724,6 +11104,8 @@ cmd_sync() {
     [[ -z "$cfg" ]] && cfg="$PTC_PROJECT_DIR/.ptc-config.yml"
     [[ -f "$cfg" ]] || { log_error "ptc sync needs the project's .ptc-config.yml (not found: $cfg); 'ptc init' writes one"; return 1; }
     cfg="$(cd "$(dirname "$cfg")" && pwd)/$(basename "$cfg")"
+    # Row 7926 (CLI-17b): in CI, a branch branches: does not name syncs nothing (one line, exit 0) before any report or upload.
+    ( cd "$PTC_PROJECT_DIR" && ptc_branch_gate "$cfg" ) >&2 || return 0
     resolve_api_token
     export PTC_API_TOKEN="${PTC_API_TOKEN:-${PTC_ORG_TOKEN:-}}"
     [[ -z "$PTC_API_TOKEN" ]] && { log_error "No API token: PTC_API_TOKEN and PTC_AGENT_TOKEN are not set. $(api_token_doors)"; return 1; }
@@ -10768,7 +11150,7 @@ cmd_sync() {
     local line=""
     case $rc in
         5) line="PTC rejected some files or could not be reached for them (see 'Rejected by PTC' / 'Could not reach PTC' above); the rest was delivered." ;;
-        6) line="Some files wait in PTC - parked for an over-limit approval, or paused out-of-credit (see the lists above); the rest was delivered. Approve in PTC or top up the credit, then re-run." ;;
+        6) line="Some files wait in PTC (see the lists above); the rest was delivered. Re-run to deliver them." ;;
         7) line="The translation is still running in PTC (see 'Still translating in PTC' above); the finished files were delivered. Retry this job once PTC finishes, or check progress / download manually with the commands printed there." ;;
     esac
     if [[ -n "$line" ]]; then
@@ -10813,6 +11195,7 @@ main() {
     # Agent-guide commands: no source locale / patterns needed.
     case "${1:-}" in
         auth)   shift; cmd_auth "$@";   exit $? ;;
+        site)   shift; cmd_site "$@";   exit $? ;;
         guide)  shift; cmd_guide "$@";  exit $? ;;
         scan)   shift; cmd_scan "$@";   exit $? ;;
         config) shift; cmd_config "$@"; exit $? ;;
@@ -10943,6 +11326,9 @@ main() {
         echo "Nothing to deliver: the files: list in $PTC_CONFIG_FILE is empty, so nothing was uploaded or written ('ptc init' detects the files)."
         exit 0
     fi
+    if [[ -z "${PTC_ACTION:-}" || "${PTC_ACTION:-}" == "upload" ]] && [[ -n "${PTC_CONFIG_FILE:-}" ]] && ! ptc_branch_gate "$PTC_CONFIG_FILE"; then
+        exit 0
+    fi
     
     # Main logic
     log_info "Starting $SCRIPT_NAME v$VERSION"
@@ -10962,9 +11348,10 @@ main() {
             log_error "Some files were rejected by PTC or could not reach it (listed above); the completed translations were written"
             exit 5
         fi
-        # 6 = partial (S2-R15, CI-16): some files wait for an over-limit approval; the completed translations were written.
+        # 6 = partial (CI-16, S2-R28-3): some files hold strings their run refused for funding; the completed translations
+        # were written.
         if [[ $rc -eq 6 ]]; then
-            log_error "Some files wait for an over-limit approval in PTC; the completed translations were written"
+            log_error "Some files wait in PTC: their run refused strings for funding (top up the credit or raise the budget in PTC); the completed translations were written"
             exit 6
         fi
         # 7 = stopped (S2-R3B F-2, CI-16): the translation is still running in PTC at the monitor bound; the completed
